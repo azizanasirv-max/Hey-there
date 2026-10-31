@@ -617,6 +617,22 @@ export default function App() {
     sessionRef.current?.updateConfig(modelConfig);
   }, [modelConfig]);
 
+  /** Manual "Restart Audio" button: bypasses the automatic recovery throttle. */
+  const handleManualAudioRestart = async () => {
+    micRecoveryRef.current = { lastAttemptAt: 0, attempts: 0 };
+    setNoticeMessage('Restarting audio capture…');
+    try {
+      await streamerRef.current.stopStreaming(true);
+      await streamerRef.current.ensureMicrophone();
+      setPermissionStatus('granted');
+      await ensureAudioRunning();
+      setErrorMessage(null);
+      setNoticeMessage('Audio capture restarted.');
+    } catch (err: any) {
+      setErrorMessage(err?.message || 'Audio restart failed.');
+    }
+  };
+
   // Mute / Unmute (silence frames keep the session alive — see AudioStreamer)
   const handleToggleMute = () => {
     const nextMuted = !isMuted;
@@ -718,7 +734,7 @@ export default function App() {
                 playerStatus={playerStatus}
                 onToggleMute={handleToggleMute}
                 onRequestPermission={handleRequestMicPermission}
-                onRetryAudio={() => void handleMicFailure('no-frames', 'Manual audio restart requested.')}
+                onRetryAudio={() => void handleManualAudioRestart()}
               />
             </div>
 

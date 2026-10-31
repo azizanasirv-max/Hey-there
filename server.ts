@@ -301,6 +301,8 @@ async function startServer() {
           }
         } else if (json.type === 'SettingsApplied') {
           isSettingsApplied = true;
+          // Arm the idle-keepalive watchdog even if the browser never sends a frame.
+          if (lastClientAudioAt === 0) lastClientAudioAt = nowMs();
           if (upstreamConnectTimer) {
             clearTimeout(upstreamConnectTimer);
             upstreamConnectTimer = null;
