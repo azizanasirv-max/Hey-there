@@ -243,3 +243,88 @@ there is no README.
 4. Text injection (`InjectUserMessage`), transcript feed, event diagnostics,
    telemetry, routing (`/prototype-1`, `/architecture`), standalone-tab banner.
 5. 24 kHz linear16 PCM in/out; no new providers, no paid infrastructure.
+
+---
+
+## Verification
+
+### Automated (executed here — `bun run test`, 35 tests, all passing)
+
+| Area | Test file | Covers |
+| --- | --- | --- |
+| PCM / resampling / framing | `tests/pcm.test.ts` (9) | no-drift resampling at 48 k and 44.1 k, chunk-boundary continuity, clamping, 20 ms framing |
+| Settings schema | `tests/settings.test.ts` (9) | documented payload shape, no client-only fields, flux-v2-only eot fields, config sanitising/clamping |
+| Playback scheduling | `tests/playbackScheduler.test.ts` (4) | gapless back-to-back scheduling, lead time, late-frame clamping |
+| Reconnect backoff | `tests/session.test.ts` (3) | exponential backoff, 8 s cap, jitter bounds |
+| Proxy protocol + audio | `tests/proxy.test.ts` (10) | handshake, settings race, byte-exact audio relay both ways, telemetry aggregation, keep-alive while muted, Error/Warning handling, upstream socket release on browser disconnect, measured hop latency |
+
+`bun run lint` (`tsc --noEmit`) and `bun run build` (`vite build`) both pass.
+
+### Real browser end-to-end (executed here — `bun run test:e2e`, 20/20 checks)
+
+Headless Chromium with Chrome's fake microphone device, the real proxy, and a
+mock Voice Agent upstream. Every assertion below is on bytes crossing the wire or
+on a live DOM value, not on a hard-coded expectation:
+
+| Check | Result |
+| --- | --- |
+| App renders and the handshake reaches READY | PASS |
+| Proxy sends `Settings` upstream | PASS (`nova-3`) |
+| Real microphone audio is streamed upstream | PASS (21+ frames) |
+| Uplink frames are 20 ms @ 24 kHz (960 B) | PASS |
+| Agent PCM frames are played (not discarded) | PASS |
+| Agent audio frame counter is non-zero | PASS (`30 frames / 28.1 KB`) |
+| Muting sends silence frames (no idle timeout) | PASS (75 frames in 1.5 s) |
+| Mute badge is truthful | PASS |
+| Reconnect attempt is surfaced | PASS |
+| Session re-establishes automatically | PASS |
+| Microphone audio flows again after reconnect (no reload) | PASS |
+| `Settings` re-sent on the new upstream socket | PASS (2 messages) |
+| Session restarts after Stop/Start | PASS |
+| Audio works after a session restart | PASS |
+| Rapid `Start` clicks open exactly one session | PASS (1 upstream connection) |
+| No uncaught page errors / unexpected console errors | PASS |
+
+What this proves: capture → resample → frame → WS → proxy → upstream works in a
+real browser, and upstream → proxy → browser → scheduled playback works, and both
+survive mute, socket loss and session restart without a page reload.
+
+What it cannot prove: Deepgram's own STT/LLM/TTS responses (the upstream is a
+mock) and real-device behaviour (fake device cannot be unplugged, real acoustic
+barge-in cannot be judged headlessly).
+
+### Manual browser checklist (real mic + `DEEPGRAM_API_KEY`)
+
+
+
+1. **Initial activation** — Start → permission prompt → mic badge *Granted*, panel shows
+   `48,000 Hz in → 24,000 Hz` and a moving RMS meter; agent voice is audible on its first reply.
+2. **Continuous operation** — talk for 60 s; VU meter responsive, transcripts keep arriving,
+   `Uplink drops` stays 0, no `CLIENT_MESSAGE_TIMEOUT`.
+3. **Consecutive interactions** — 10+ turns; `Agent Audio` frame counter keeps rising,
+   `Playback queue` returns to ~0 ms between turns.
+4. **Mute for 60 s** — status shows *Muted (sending silence)*, session stays `READY`,
+   `Mic PCM Frames` keeps incrementing (silence frames).
+5. **WebSocket reconnect** — kill the server / toggle Wi-Fi for 3 s: banner shows
+   *Reconnecting (attempt n)*, then *Session restored*, `Reconnects` = 1, audio works without a reload.
+6. **Tab visibility** — background the tab 30 s, return: capture context is `running`
+   and the meter moves (contexts are resumed; a stalled graph auto-restarts).
+7. **Device loss** — unplug the headset mid-session: a specific error appears, the app
+   re-acquires the device (≤3 bounded attempts) or tells you to plug it back in.
+8. **Session restart** — Stop then Start: no second mic indicator, no leftover socket
+   (`browser disconnect releases the upstream socket` behaviour), audio resumes.
+9. **Rapid interactions** — double-click Start repeatedly: only one session is created
+   (guard), only one `getUserMedia` stream exists.
+10. **Long session / leak check** — 20 min of talking: `agentAudioFrames`/`sentAudioChunks`
+    grow linearly, `framesDropped`/`underruns` stay near 0, browser memory stable
+    (playback `AudioBufferSourceNode`s are released in `onended`), Chrome shows a single mic indicator.
+
+### Known functional limits
+
+* If the browser refuses a 24 kHz `AudioContext` (some Safari versions), playback
+  resamples to the device rate via the streaming resampler (extra CPU, no gaps).
+* `AudioWorklet` requires a secure context; otherwise the `ScriptProcessor`
+  fallback is used (still 20 ms framing, but on the main thread).
+* A Deepgram `Error` always ends the session (per docs); the client reconnects up to
+  5 times, and gives up after 2 consecutive server-reported `Error`s with the exact
+  code shown in the UI.

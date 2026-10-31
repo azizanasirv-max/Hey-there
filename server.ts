@@ -27,7 +27,7 @@ const UPSTREAM_CONNECT_TIMEOUT_MS = 12000;
  * relay a `KeepAlive` upstream when no microphone audio was forwarded for this
  * long. The documented cadence is one KeepAlive every 8 s while idle.
  */
-const CLIENT_AUDIO_IDLE_KEEPALIVE_MS = 8000;
+const CLIENT_AUDIO_IDLE_KEEPALIVE_MS = Number(process.env.PROXY_IDLE_KEEPALIVE_MS || 8000);
 /** Aggregate agent-audio telemetry instead of one JSON message per frame. */
 const AUDIO_STATS_INTERVAL_MS = 1000;
 /** Liveness ping for the browser socket (detects dead TCP, frees upstream sockets). */

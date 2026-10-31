@@ -56,11 +56,15 @@ const KEEPALIVE_IDLE_MS = 8000;
 /** Refuse to queue more than this on a back-pressured socket. */
 const MAX_BUFFERED_BYTES = 512 * 1024;
 
-/** Exponential backoff with jitter: 500, 1000, 2000, 4000, 8000 ms (±20%). */
+/**
+ * Exponential backoff with ±20% jitter: ~500, 1000, 2000, 4000, 8000 ms.
+ * The result is always clamped to MAX_RECONNECT_DELAY_MS so a reconnect burst
+ * can never grow unbounded.
+ */
 export function reconnectDelay(attempt: number, random: () => number = Math.random): number {
   const base = Math.min(8000, 500 * Math.pow(2, Math.max(0, attempt - 1)));
   const jitter = 0.8 + random() * 0.4;
-  return Math.round(base * jitter);
+  return Math.min(8000, Math.round(base * jitter));
 }
 
 /** Default proxy URL for the current page origin. */
@@ -215,6 +219,7 @@ export class VoiceAgentSession {
     }
 
     if (type === 'SessionReady' || type === 'SettingsApplied') {
+      this.handlers.onEvent?.(type, data, receivedAt);
       this.ready = true;
       this.consecutiveFatal = 0;
       this.clearHandshakeWatchdog();

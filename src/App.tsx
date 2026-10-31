@@ -577,9 +577,9 @@ export default function App() {
           setAgentThinking(false);
           playerRef.current.flush();
           if (!willReconnect) {
-            streamerRef.current.stopStreaming(false);
+            streamerRef.current.stopStreaming(true);
             sessionStartedRef.current = false;
-            if (code !== 1000 && !errorMessage) {
+            if (code !== 1000) {
               setNoticeMessage(
                 `Session ended (code ${code}${reason ? `: ${reason}` : ''}). Press Start to open a new session.`
               );
