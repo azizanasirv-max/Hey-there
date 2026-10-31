@@ -253,6 +253,107 @@ Aura model string with `version: "v2"` resolves against the wrong endpoint.
 
 ---
 
+## D14 — P0 — Invalid LLM model ids offered in the UI (`claude-3-5-sonnet`, `llama-3.3-70b-instruct`)
+
+**Observed:** Choosing either of those *Thinking Model* options makes the session die
+instantly with a Deepgram error (audio goes dead).
+
+**Cause:** The dropdown listed models that are **not** in the `open_ai` provider enum. The
+AsyncAPI schema allows exactly `gpt-5, gpt-5-mini, gpt-5-nano, gpt-4.1, gpt-4.1-mini,
+ gpt-4.1-nano, gpt-4o, gpt-4o-mini`. Anything else produces a fatal `INVALID_SETTINGS`.
+
+**Files:** `src/components/ConnectionPanel.tsx`, `src/shared/voiceAgentConfig.ts`,
+`server.ts`.
+
+**Fix:** The dropdown only offers valid `open_ai` models, and the proxy validates the
+config **before** sending `Settings` (unknown model ⇒ corrected to `gpt-4o-mini` plus a
+`Warning{SETTINGS_CORRECTED}` in the UI), so a stale/edited config can no longer kill a
+session.
+
+---
+
+## D15 — P0 — `ConversationText` had no de-duplication and no turn association
+
+**Observed:** After a reconnect (or any replayed transcript) the same assistant line appeared
+twice; messages were not attributable to a conversation turn.
+
+**Cause:** `App.tsx` appended every `ConversationText` to `messages` unconditionally with a
+random id and no turn context. It also computed latency from a single mutable ref that was
+overwritten on every `UserStartedSpeaking`.
+
+**Files:** `src/App.tsx`, new `src/utils/conversation.ts`, `src/components/ConversationPanel.tsx`.
+
+**Fix:** A pure `ConversationTracker` reduces events → messages: immediate display,
+content+role de-duplication (with a bounded memory that survives reconnects), turn ids,
+`conversational_behavior` tags, and the per-turn latency timeline.
+
+---
+
+## D16 — P1 — HTTP 202 was displayed as a backend failure (and waited forever)
+
+**Observed:** With an edge/proxy that answers `GET /api/health` with `202 Accepted`
+(asynchronous acceptance while the service warms up) the UI showed *Backend Offline* /
+*Key Missing* and the Start button stayed disabled permanently.
+
+**Cause:** `checkHealth()` treated any 2xx as ready (`res.ok`) and then called
+`res.json()` unconditionally. A 202 with an empty body throws → `setHealth(null)`; a 202
+with a job-id body has no `deepgramApiKeyConfigured` → *Key Missing*. There was no retry,
+so the client waited forever and never recovered.
+
+**Files:** `src/App.tsx`, new `src/utils/http.ts`, `Header`, `ConnectionPanel`.
+
+**Fix:** `probeBackendHealth()` with an explicit contract (200 = ready, 202/204 = starting
+with `job_id`/`Retry-After`, non-JSON 2xx = routing error, 4xx/5xx = unavailable, network
+= error) plus bounded auto-retry (60 s) and a truthful *Backend starting (HTTP 202)* state.
+See `docs/SETTINGS_VERIFICATION.md` §5 and the reproducible edge-proxy test.
+
+---
+
+## D17 — P1 — Plain HTTP requests to the WebSocket path returned the SPA (HTTP 200 HTML)
+
+**Cause:** `express.static` + `app.get('*') → index.html` ran before any API guard, so
+`GET /api/agent-proxy`, `GET /api/typo` and every unknown path answered `200 text/html`.
+Any client that checks `res.ok` (or an operator curling the health/WS endpoint through an
+edge) sees a "successful" response that is not the API — the same class of confusion as
+the 202 report.
+
+**Files:** `server.ts`.
+
+**Fix:** explicit guards before the SPA: `app.all('/api/agent-proxy') → 426 Upgrade
+Required` (+ `Upgrade: websocket`), `app.all('/api/*') → 404 JSON`, and
+`Cache-Control: no-store` on `/api/health`. Covered by `tests/protocol.test.ts`.
+
+---
+
+## D18 — P0 — `KeepAlive` could be forwarded upstream *before* `Settings`
+
+**Cause:** `server.ts` forwarded a client `KeepAlive` whenever the upstream socket was
+open, regardless of `isSettingsApplied`. Sending any message before `Settings` is a fatal
+protocol violation (`NON_SETTINGS_MESSAGE_BEFORE_SETTINGS`) and kills the session.
+
+**Files:** `server.ts`.
+
+**Fix:** `KeepAlive` (like audio and `InjectUserMessage`) is only forwarded after
+`SettingsApplied`; the idle keep-alive timer is armed on `SettingsApplied`. Asserted by
+"nothing but Settings is sent upstream before SettingsApplied".
+
+---
+
+## D19 — P1 — No handling for the Flux turn lifecycle (eager EOT / resume)
+
+**Cause:** `EagerEndOfTurn`, `TurnResumed`, `EndOfTurn` and `TurnInfo` fell through to the
+generic event log, so a speculative turn had no visible state and could not be cancelled
+in the UI.
+
+**Files:** `src/App.tsx`, `src/utils/conversation.ts`, `ConversationPanel`.
+
+**Fix:** tracked as a first-class turn state (`speculative`), surfaced as a dismissal-safe
+badge, cancelled on `TurnResumed`/barge-in, finalised on `EndOfTurn`, and never turned
+into a reply (no duplicate answers). Also documented that the Voice Agent server does not
+emit these events today (they are Flux-STT level) — see verification §4.
+
+---
+
 ## Preserved behaviour (must not regress)
 
 1. Strict handshake: `Welcome` → `Settings` → `SettingsApplied` → audio unlocked.
@@ -267,19 +368,22 @@ Aura model string with `version: "v2"` resolves against the wrong endpoint.
 
 ## Verification
 
-### Automated (executed here — `bun run test`, 37 tests, all passing)
+### Automated (executed here — `bun run test`, 80 tests, all passing)
 
 | Area | Test file | Covers |
 | --- | --- | --- |
 | PCM / resampling / framing | `tests/pcm.test.ts` (9) | no-drift resampling at 48 k and 44.1 k, chunk-boundary continuity, clamping, 20 ms framing |
-| Settings schema | `tests/settings.test.ts` (11) | documented payload shape, no client-only fields, flux-v2-only eot fields, TTS family version (flux v2 / aura v1), config sanitising/clamping |
+| Settings schema | `tests/settings.test.ts` (21) | documented payload shape, no client-only fields, `flags.history`, language (`language` vs `language_hints`), prompt, fallback arrays, speak speed ranges, flux-v2-only eot fields, TTS family version, invalid LLM model correction, config sanitising/clamping |
+| ConversationText / turns | `tests/conversation.test.ts` (14) | assistant + user text accepted with no audio, text before/after/interleaved with audio, duplicate suppression (+ replays after reconnect), turn association, eager EOT → resume → end-of-turn, barge-in cancellation, latency timeline, malformed events |
+| HTTP contract | `tests/http.test.ts` (11) | 200 vs 202 vs 204 vs 5xx vs HTML body vs network error, `Retry-After` parsing, job id extraction, upgrade probe naming a 202/404 |
+| Protocol lifecycle | `tests/protocol.test.ts` (8) | exactly one Settings, no audio/KeepAlive/Inject before SettingsApplied, late SettingsApplied unlocks audio, malformed client JSON, unexpected server events relayed, clean reconnect, 426/404/no-store routes, reproducible HTTP 202 edge |
 | Playback scheduling | `tests/playbackScheduler.test.ts` (4) | gapless back-to-back scheduling, lead time, late-frame clamping |
 | Reconnect backoff | `tests/session.test.ts` (3) | exponential backoff, 8 s cap, jitter bounds |
 | Proxy protocol + audio | `tests/proxy.test.ts` (10) | handshake, settings race, byte-exact audio relay both ways, telemetry aggregation, keep-alive while muted, Error/Warning handling, upstream socket release on browser disconnect, measured hop latency |
 
 `bun run lint` (`tsc --noEmit`) and `bun run build` (`vite build`) both pass.
 
-### Real browser end-to-end (executed here — `bun run test:e2e`, 20/20 checks)
+### Real browser end-to-end (executed here — `bun run test:e2e`, 32/32 checks)
 
 Headless Chromium with Chrome's fake microphone device, the real proxy, and a
 mock Voice Agent upstream. Every assertion below is on bytes crossing the wire or
@@ -302,6 +406,14 @@ on a live DOM value, not on a hard-coded expectation:
 | Session restarts after Stop/Start | PASS |
 | Audio works after a session restart | PASS |
 | Rapid `Start` clicks open exactly one session | PASS (1 upstream connection) |
+| User `ConversationText` painted immediately | PASS |
+| Assistant `ConversationText` painted immediately (before `AgentAudioDone`) | PASS |
+| Text stays visible while audio streams | PASS |
+| `ConversationText` arriving after audio is still displayed | PASS |
+| Duplicate `ConversationText` rendered once | PASS |
+| Event → painted text latency | PASS (p50 = 4 ms) |
+| `EagerEndOfTurn` shows speculative state, `TurnResumed` clears it | PASS |
+| `TurnResumed` fabricates no reply; `EndOfTurn` finalises exactly one | PASS |
 | No uncaught page errors / unexpected console errors | PASS |
 
 What this proves: capture → resample → frame → WS → proxy → upstream works in a

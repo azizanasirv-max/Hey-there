@@ -87,6 +87,36 @@ delay the transcript/response rendering). The dominant remaining terms — STT
 end-of-turn, LLM first token, TTS first byte — are Deepgram-side and now visible
 in the *Measured turn latency* panel instead of being guessed at.
 
+## 3b. ConversationText display latency (measured in a real browser)
+
+`bun run test:e2e` measures the real path *Deepgram event → React render → painted
+pixels* using `page.waitForFunction(..., {polling: 'raf'})`. Six consecutive
+`ConversationText` events, mid-session, with audio streaming at the same time:
+
+```
+[latency] ConversationText -> painted text: p50=4 ms, samples=3,3,3,4,5,7 ms
+```
+
+So the transcript is on screen ~4 ms after the event arrives — it does not wait for
+`AgentAudioDone`, for the audio queue to drain, or for the turn to finish. The same run
+asserts the text is visible **while** 20 audio frames (≈400 ms of speech) are still
+flowing, and that a `ConversationText` arriving *after* audio is displayed too.
+
+Per-turn stage timings are now shown in the UI (*Measured turn latency*):
+
+| Stage | Source |
+| --- | --- |
+| speech start → first text | browser (`ConversationTracker`) |
+| speech start → first audio frame | browser |
+| end-of-turn → first text / first audio | browser |
+| text → audio (positive = text first) | browser |
+| speculative window / gain | browser (Flux eager EOT) |
+| STT / LLM TTFB / TTS / total | Deepgram `LatencyReport` event |
+
+`bun run test:live` prints median/p95/max for time-to-first-text, time-to-first-audio
+and turn total over 10 live turns — it requires `DEEPGRAM_API_KEY` and **prints
+`SKIPPED` in this environment** (no credentials), so no live numbers are claimed here.
+
 ## 4. Where the remaining latency lives (and what was rejected)
 
 * **End-of-turn detection (Deepgram-side).** With `nova-3` (v1 listen provider)
@@ -121,6 +151,8 @@ in the *Measured turn latency* panel instead of being guessed at.
   measurement of *our* proxy's behaviour, not proof of Deepgram integration.
 * `SettingsApplied -> first agent audio: 564 ms` in §1 is harness timing (the
   mock starts streaming 500 ms after `SessionReady`), not a latency figure.
+* Text display is not a latency win in the STT/LLM/TTS path — it removes the *perceived*
+  wait for the first audio. The measured 4 ms is render latency only, not a model speed-up.
 * Browser-only behaviour (AudioWorklet availability, `AudioContext` autoplay
   policy, `devicechange`, tab suspension) is covered by code paths, unit tests
   and the watchdog logic, but was **not** executed in a real browser here — see

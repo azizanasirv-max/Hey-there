@@ -35,7 +35,8 @@ Without `DEEPGRAM_API_KEY` the UI still loads, `/api/health` reports
 | `bun run build` | Production client build into `dist/` |
 | `bun run lint` | `tsc --noEmit` |
 | `bun run test` | Node test runner: unit + proxy integration tests (`node --import tsx --test`) |
-| `bun run test:e2e` | Headless-Chromium end-to-end audio verification (fake mic, real proxy) |
+| `bun run test:e2e` | Headless-Chromium end-to-end verification: audio + immediate ConversationText (fake mic, real proxy) |
+| `bun run test:live` | Optional live Deepgram run (10 turns, real key required; prints SKIPPED without one) |
 | `bun run bench` | Measured before/after benchmark (`scripts/bench-pipeline.ts`) |
 
 ## Audio pipeline
@@ -53,7 +54,16 @@ Without `DEEPGRAM_API_KEY` the UI still loads, `/api/health` reports
   bounded microphone re-acquire; a dropped socket reconnects with exponential
   backoff (0.5→8 s, 5 attempts) and resumes audio without a page reload.
 
+* **Transcript** — `ConversationText` is rendered the moment it arrives (measured p50 ≈ 4 ms
+  event → painted text); it never waits for audio, `AgentAudioDone`, or playback. Duplicates
+  are suppressed and every message is tagged with its conversation turn.
+* **HTTP status contract** — `GET /api/health` distinguishes `200` (ready) from `202/204`
+  (accepted/starting: auto-retry, never "offline") and the WebSocket path answers `426
+  Upgrade Required` over plain HTTP instead of the SPA's HTML/D. A non-101 handshake is
+  diagnosed with a follow-up HTTP probe.
+
 Details of every fixed defect: [`docs/DEFECT_REPORT.md`](docs/DEFECT_REPORT.md).
+Deepgram settings/protocol verification (field by field): [`docs/SETTINGS_VERIFICATION.md`](docs/SETTINGS_VERIFICATION.md).
 Measured latency before/after: [`docs/LATENCY_REPORT.md`](docs/LATENCY_REPORT.md).
 
 ## Configuration
@@ -77,8 +87,8 @@ provider or model defaults were changed by the reliability/latency work.
 ## Testing
 
 ```bash
-bun run test     # 37 tests: unit (pcm / settings / playback / backoff) + proxy integration
-bun run test:e2e # 20 browser checks with a fake microphone (needs Chromium)
+bun run test     # 80 tests: unit (pcm / settings / playback / backoff / conversation / http) + proxy + protocol integration
+bun run test:e2e # 32 browser checks with a fake microphone (needs Chromium)
 bun run bench    # runs the original server (git commit ad474ee) side-by-side with the fix
 ```
 
