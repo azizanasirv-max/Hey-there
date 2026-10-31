@@ -43,7 +43,13 @@ async function main() {
   if (!CHROME_PATH) throw new Error('No Chromium binary found; set CHROME_PATH');
 
   const upstream = await startMockUpstream();
-  const proxy = await startProxy({ DEEPGRAM_AGENT_URL: upstream.url });
+  // Development mode (Vite middleware) so the browser always loads the current
+  // sources instead of a possibly stale dist/ build.
+  const proxy = await startProxy({
+    DEEPGRAM_AGENT_URL: upstream.url,
+    NODE_ENV: 'development',
+    DISABLE_HMR: 'true',
+  });
   const port = new URL(proxy.httpUrl).port;
 
   let browser: Browser | null = null;
