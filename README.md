@@ -77,7 +77,7 @@ provider or model defaults were changed by the reliability/latency work.
 ## Testing
 
 ```bash
-bun run test     # 35 tests: unit (pcm / settings / playback / backoff) + proxy integration
+bun run test     # 37 tests: unit (pcm / settings / playback / backoff) + proxy integration
 bun run test:e2e # 20 browser checks with a fake microphone (needs Chromium)
 bun run bench    # runs the original server (git commit ad474ee) side-by-side with the fix
 ```

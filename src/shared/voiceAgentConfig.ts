@@ -69,6 +69,21 @@ export function isFluxListenModel(model: string): boolean {
   return typeof model === 'string' && /^flux/i.test(model.trim());
 }
 
+/**
+ * Deepgram TTS families are selected by `provider.version`: Flux voices stream
+ * on the v2 endpoint, Aura voices live on v1 (the server default). Sending `v2`
+ * with an Aura model makes the agent resolve the wrong TTS endpoint and fail, so
+ * the version is derived from the model family.
+ *
+ * Docs: https://developers.deepgram.com/docs/voice-agent-tts-models
+ */
+export function speakProviderVersion(model: string, configured?: string): string {
+  const name = typeof model === 'string' ? model.trim().toLowerCase() : '';
+  if (name.startsWith('flux')) return 'v2';
+  if (name.startsWith('aura')) return 'v1';
+  return configured === 'v2' || configured === 'v1' ? configured : 'v2';
+}
+
 function asString(value: unknown, fallback: string): string {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : fallback;
 }
@@ -153,7 +168,7 @@ export function buildAgentSettingsMessage(cfg: AgentModelConfig): Record<string,
       provider: {
         type: cfg.speakProvider,
         model: cfg.speakModel,
-        version: cfg.speakVersion || 'v2',
+        version: speakProviderVersion(cfg.speakModel, cfg.speakVersion),
       },
     },
   };

@@ -228,9 +228,28 @@ vs `Warning` (non-fatal → surfaced as warning, session continues).
 the template) but **not** `DEEPGRAM_API_KEY`, which the app cannot run without;
 there is no README.
 
-**Fix:** Document `DEEPGRAM_API_KEY` (and the optional
-`DEEPGRAM_AGENT_URL` / `LOW_LATENCY_TURN_DETECTION` knobs) in `.env.example` +
-`README.md`.
+**Fix:** Document `DEEPGRAM_API_KEY` (plus the optional `PORT`,
+`DEEPGRAM_AGENT_URL` and `PROXY_IDLE_KEEPALIVE_MS` overrides) in `.env.example`
+and add a `README.md` with setup, scripts and the audio pipeline overview.
+
+---
+
+## D13 — P0 — Aura TTS voices are sent to the Flux (v2) endpoint
+
+**Observed:** Selecting `aura-asteria-en` / `aura-luna-en` / `aura-stella-en` in
+*Config Models* produces no voice (or an `INVALID_SETTINGS` / `FAILED_TO_SPEAK`
+style failure) even though Flux voices work.
+
+**Cause:** `server.ts` always sent `agent.speak.provider.version = speakVersion ||'v2'`.
+Per the TTS Models reference the `version` field *selects the TTS family*:
+`v2` = Flux, `v1` = Aura (and `v1` is the default for supplied providers). An
+Aura model string with `version: "v2"` resolves against the wrong endpoint.
+
+**Files:** `server.ts` → `src/shared/voiceAgentConfig.ts` (`speakProviderVersion`).
+
+**Fix:** The version is derived from the model family: `flux*` → `v2`,
+`aura*` → `v1`, anything else keeps the configured value. Covered by
+`tests/settings.test.ts`.
 
 ---
 
@@ -248,12 +267,12 @@ there is no README.
 
 ## Verification
 
-### Automated (executed here — `bun run test`, 35 tests, all passing)
+### Automated (executed here — `bun run test`, 37 tests, all passing)
 
 | Area | Test file | Covers |
 | --- | --- | --- |
 | PCM / resampling / framing | `tests/pcm.test.ts` (9) | no-drift resampling at 48 k and 44.1 k, chunk-boundary continuity, clamping, 20 ms framing |
-| Settings schema | `tests/settings.test.ts` (9) | documented payload shape, no client-only fields, flux-v2-only eot fields, config sanitising/clamping |
+| Settings schema | `tests/settings.test.ts` (11) | documented payload shape, no client-only fields, flux-v2-only eot fields, TTS family version (flux v2 / aura v1), config sanitising/clamping |
 | Playback scheduling | `tests/playbackScheduler.test.ts` (4) | gapless back-to-back scheduling, lead time, late-frame clamping |
 | Reconnect backoff | `tests/session.test.ts` (3) | exponential backoff, 8 s cap, jitter bounds |
 | Proxy protocol + audio | `tests/proxy.test.ts` (10) | handshake, settings race, byte-exact audio relay both ways, telemetry aggregation, keep-alive while muted, Error/Warning handling, upstream socket release on browser disconnect, measured hop latency |

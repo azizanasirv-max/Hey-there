@@ -7,6 +7,7 @@ import {
   buildAgentSettingsMessage,
   isFluxListenModel,
   normalizeAgentConfig,
+  speakProviderVersion,
 } from '../src/shared/voiceAgentConfig';
 
 test('default settings match the documented Voice Agent schema', () => {
@@ -92,4 +93,32 @@ test('greeting is only included when provided', () => {
   assert.equal(withGreeting.agent.greeting, 'Hi there!');
   const without: any = buildAgentSettingsMessage(DEFAULT_AGENT_CONFIG);
   assert.equal('greeting' in without.agent, false);
+});
+
+test('speak provider version follows the TTS family (flux=v2, aura=v1)', () => {
+  const flux = buildAgentSettingsMessage({
+    ...DEFAULT_AGENT_CONFIG,
+    speakModel: 'flux-kit-en',
+    speakVersion: 'v2',
+  }) as any;
+  assert.equal(flux.agent.speak.provider.version, 'v2');
+
+  // Aura voices must not be sent to the Flux (v2) TTS endpoint.
+  for (const model of ['aura-asteria-en', 'aura-luna-en', 'aura-2-thalia-en']) {
+    const aura = buildAgentSettingsMessage({
+      ...DEFAULT_AGENT_CONFIG,
+      speakModel: model,
+      speakVersion: 'v2', // UI default must not leak into the payload for Aura
+    }) as any;
+    assert.equal(aura.agent.speak.provider.version, 'v1', model);
+    assert.equal(aura.agent.speak.provider.model, model);
+  }
+});
+
+test('speakProviderVersion covers unknown providers and explicit overrides', () => {
+  assert.equal(speakProviderVersion('flux-kit-en'), 'v2');
+  assert.equal(speakProviderVersion('aura-stella-en'), 'v1');
+  assert.equal(speakProviderVersion('some_custom_voice', 'v1'), 'v1');
+  assert.equal(speakProviderVersion('some_custom_voice'), 'v2');
+  assert.equal(speakProviderVersion('', undefined), 'v2');
 });
