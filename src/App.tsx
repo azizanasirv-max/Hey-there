@@ -10,6 +10,8 @@ import { ArchitectureView } from './components/ArchitectureView';
 import { AudioStreamer, AudioStreamerState, MicFailureReason } from './utils/audioStreamer';
 import { PcmAudioPlayer, PlayerStats } from './utils/audioPlayer';
 import { VoiceAgentSession } from './utils/voiceAgentSession';
+import { ConversationTracker } from './utils/conversation';
+import { probeBackendHealth, probeAgentUpgrade } from './utils/http';
 import {
   ConnectionStatus,
   ModelConfig,
@@ -19,11 +21,15 @@ import {
   SessionTelemetry,
   LatencyMetrics,
   MicStatus,
+  BackendHealthState,
   EMPTY_LATENCY,
 } from './types/deepgram';
 import { DEFAULT_AGENT_CONFIG } from './shared/voiceAgentConfig';
 import { MonitorCheck } from 'lucide-react';
 
+
+/** How long the UI waits for a 202/204-accepted backend before surfacing an error. */
+const MAX_HEALTH_STARTUP_WAIT_MS = 60_000;
 
 const EMPTY_TELEMETRY: SessionTelemetry = {
   startTime: null,
@@ -93,6 +99,12 @@ export default function App() {
 
   // Backend Health
   const [health, setHealth] = useState<BackendHealthResponse | null>(null);
+  const [healthState, setHealthState] = useState<BackendHealthState>('unknown');
+  const [healthMessage, setHealthMessage] = useState<string | null>(null);
+  const [healthHttpStatus, setHealthHttpStatus] = useState<number | null>(null);
+  const [healthTick, setHealthTick] = useState(0);
+  const healthWaitStartRef = useRef<number | null>(null);
+  const healthPollAttemptsRef = useRef(0);
 
   // Connection State
   const [status, setStatus] = useState<ConnectionStatus>('DISCONNECTED');
@@ -135,34 +147,66 @@ export default function App() {
     agentAudioBytes: 0,
     receivedTextEvents: 0,
   });
-  const turnRef = useRef<{
-    userStartedAt: number | null;
-    firstTextAt: number | null;
-    firstAudioAt: number | null;
-  }>({ userStartedAt: null, firstTextAt: null, firstAudioAt: null });
+  /** Conversation/turn state machine (pure, unit tested — src/utils/conversation.ts). */
+  const trackerRef = useRef(new ConversationTracker());
+  const [speculative, setSpeculative] = useState(false);
   const micRecoveryRef = useRef<{ lastAttemptAt: number; attempts: number }>({ lastAttemptAt: 0, attempts: 0 });
   const playerStatsRef = useRef<PlayerStats>(EMPTY_PLAYER_STATUS);
   const sessionStartedRef = useRef(false);
 
-  // 1. Fetch Backend Health
-  const checkHealth = useCallback(async () => {
-    try {
-      const res = await fetch('/api/health');
-      if (res.ok) {
-        const data: BackendHealthResponse = await res.json();
-        setHealth(data);
-      } else {
-        setHealth(null);
+  // 1. Backend health — explicit HTTP status contract (see src/utils/http.ts).
+  //    HTTP 202/204 means "accepted, still starting": poll with backoff instead
+  //    of reporting the backend as offline (and never treat a 2xx as ready).
+  const probeHealth = useCallback(async () => {
+    const result = await probeBackendHealth('/api/health');
+    healthPollAttemptsRef.current += 1;
+    setHealthHttpStatus(result.httpStatus);
+    setHealthMessage(result.message);
+    setHealthState(result.state);
+
+    if (result.health) setHealth(result.health);
+    else if (result.state !== 'starting') setHealth(null);
+
+    if (result.state === 'starting') {
+      if (healthWaitStartRef.current === null) healthWaitStartRef.current = Date.now();
+      const waitedMs = Date.now() - healthWaitStartRef.current;
+      if (waitedMs >= MAX_HEALTH_STARTUP_WAIT_MS) {
+        setHealthState('error');
+        setHealthMessage(
+          `Backend still answering HTTP ${result.httpStatus ?? 'n/a'} after ${Math.round(
+            MAX_HEALTH_STARTUP_WAIT_MS / 1000
+          )}s (${healthPollAttemptsRef.current} probes). ` +
+            'The edge/proxy is accepting the request asynchronously instead of serving it — check that HTTPS ' +
+            'traffic to /api/health reaches this server.'
+        );
       }
-    } catch (e) {
-      console.error('Health check failed:', e);
-      setHealth(null);
+    } else {
+      healthWaitStartRef.current = null;
+      healthPollAttemptsRef.current = 0;
     }
+
+    // Re-arm the poll for the next tick (bounded by MAX_HEALTH_STARTUP_WAIT_MS).
+    setHealthTick((n) => n + 1);
+    return result;
   }, []);
 
+  const checkHealth = useCallback(async () => {
+    healthWaitStartRef.current = null;
+    healthPollAttemptsRef.current = 0;
+    await probeHealth();
+  }, [probeHealth]);
+
   useEffect(() => {
-    checkHealth();
-  }, [checkHealth]);
+    void probeHealth();
+  }, [probeHealth]);
+
+  // Retry loop while the backend reports "starting" (202/204).
+  useEffect(() => {
+    if (healthState !== 'starting') return;
+    const delay = Math.min(3000, 500 * Math.pow(1.6, Math.min(6, healthPollAttemptsRef.current)));
+    const timer = setTimeout(() => void probeHealth(), delay);
+    return () => clearTimeout(timer);
+  }, [healthState, healthTick, probeHealth]);
 
   // Session Duration Timer
   useEffect(() => {
@@ -373,54 +417,103 @@ export default function App() {
         case 'UserStartedSpeaking': {
           // Barge-in: the user talks over the agent -> stop playback instantly.
           playerRef.current.flush();
-          turnRef.current = { userStartedAt: receivedAt, firstTextAt: null, firstAudioAt: null };
+          trackerRef.current.noteUserStartedSpeaking(receivedAt);
           setUserSpeaking(true);
           setAgentThinking(false);
+          setSpeculative(false);
           break;
         }
         case 'AgentStartedSpeaking': {
           playerRef.current.beginTurn();
           setAgentThinking(false);
+          setSpeculative(false);
           break;
         }
         case 'AgentThinking': {
+          trackerRef.current.noteAgentThinking(receivedAt);
           setAgentThinking(true);
           setUserSpeaking(false);
           break;
         }
         case 'AgentAudioDone': {
+          trackerRef.current.noteAgentAudioDone(receivedAt);
           setAgentThinking(false);
           playerRef.current.beginTurn();
           break;
         }
+        /**
+         * Flux turn lifecycle. In the Voice Agent integration the agent performs
+         * eager (speculative) processing server-side when
+         * `eager_eot_threshold` is configured; these events are handled here for
+         * protocol completeness and to reflect/cancel speculative UI state
+         * without ever producing a duplicate reply.
+         */
+        case 'EagerEndOfTurn': {
+          trackerRef.current.noteEagerEndOfTurn(receivedAt, data?.transcript);
+          setSpeculative(true);
+          setAgentThinking(true);
+          setUserSpeaking(false);
+          break;
+        }
+        case 'TurnResumed': {
+          // The user kept talking: cancel the speculative turn (no reply is
+          // shown, because assistant text is only emitted once confirmed).
+          trackerRef.current.noteTurnResumed(receivedAt);
+          setSpeculative(false);
+          setAgentThinking(false);
+          setUserSpeaking(true);
+          break;
+        }
+        case 'EndOfTurn': {
+          trackerRef.current.noteEndOfTurn(receivedAt);
+          setSpeculative(false);
+          break;
+        }
+        case 'TurnInfo': {
+          // Defensive: Flux STT-style payloads use `event` inside `TurnInfo`.
+          const evt = data?.event;
+          if (evt === 'EagerEndOfTurn') {
+            trackerRef.current.noteEagerEndOfTurn(receivedAt, data?.transcript);
+            setSpeculative(true);
+            setAgentThinking(true);
+          } else if (evt === 'TurnResumed') {
+            trackerRef.current.noteTurnResumed(receivedAt);
+            setSpeculative(false);
+            setAgentThinking(false);
+          } else if (evt === 'EndOfTurn') {
+            trackerRef.current.noteEndOfTurn(receivedAt);
+            setSpeculative(false);
+          }
+          break;
+        }
+        /**
+         * ConversationText — rendered IMMEDIATELY on arrival. Nothing here waits
+         * for audio frames, `AgentAudioDone`, or playback; the transcript and the
+         * speaker run independently.
+         */
         case 'ConversationText': {
-          const role: 'user' | 'assistant' = data?.role === 'user' ? 'user' : 'assistant';
-          const content: string = data?.content || data?.text || '';
-          if (role === 'user') setUserSpeaking(false);
-
-          if (content.trim().length > 0) {
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: `${receivedAt}-${Math.random().toString(36).substring(2, 6)}`,
-                role,
-                content,
-                timestamp: new Date(receivedAt).toLocaleTimeString(),
-                isFinal: data?.is_final ?? true,
-              },
-            ]);
+          const result = trackerRef.current.noteConversationText(data, receivedAt);
+          if (result.accepted && result.message) {
+            setMessages((prev) => [...prev, result.message!]);
             pendingStatsRef.current.receivedTextEvents += 1;
             statsDirtyRef.current = true;
-          }
-
-          const turn = turnRef.current;
-          if (role === 'assistant' && turn.userStartedAt && !turn.firstTextAt) {
-            turn.firstTextAt = receivedAt;
-            const delta = receivedAt - turn.userStartedAt;
-            setTelemetry((prev) => ({
-              ...prev,
-              latency: { ...prev.latency, speechStartToFirstTextMs: delta },
-            }));
+            if (result.message.role === 'user') setUserSpeaking(false);
+            if (result.isFirstAssistantText) {
+              const lat = trackerRef.current.latency();
+              setTelemetry((prev) => ({
+                ...prev,
+                latency: {
+                  ...prev.latency,
+                  speechStartToFirstTextMs: lat.speechStartToFirstTextMs,
+                  eotToFirstTextMs: lat.eotToFirstTextMs,
+                  speculativeWindowMs: lat.speculativeWindowMs,
+                  speculativeGainMs: lat.speculativeGainMs,
+                  turnResumes: trackerRef.current.current.turnResumedCount,
+                },
+              }));
+            }
+          } else if (result.reason === 'duplicate') {
+            console.debug('[Conversation] duplicate ConversationText ignored:', data?.content);
           }
           break;
         }
@@ -476,21 +569,27 @@ export default function App() {
   );
 
   const handleAgentAudio = useCallback((frame: ArrayBuffer, receivedAt: number) => {
-    const turn = turnRef.current;
-    if (!turn.firstAudioAt) {
-      turn.firstAudioAt = receivedAt;
-      if (turn.userStartedAt) {
-        const delta = receivedAt - turn.userStartedAt;
-        setTelemetry((prev) => ({
-          ...prev,
-          latency: { ...prev.latency, speechStartToFirstAudioMs: delta },
-        }));
-      }
-    }
+    trackerRef.current.noteAudioFrame(receivedAt);
     pendingStatsRef.current.agentAudioFrames += 1;
     pendingStatsRef.current.agentAudioBytes += frame.byteLength;
     statsDirtyRef.current = true;
+
+    // Playback is independent of the transcript: enqueue immediately.
     playerRef.current.enqueue(frame);
+
+    const turn = trackerRef.current.current;
+    if (turn.firstAudioAt === receivedAt) {
+      const lat = trackerRef.current.latency();
+      setTelemetry((prev) => ({
+        ...prev,
+        latency: {
+          ...prev.latency,
+          speechStartToFirstAudioMs: lat.speechStartToFirstAudioMs,
+          eotToFirstAudioMs: lat.eotToFirstAudioMs,
+          firstTextToFirstAudioMs: lat.firstTextToFirstAudioMs,
+        },
+      }));
+    }
   }, []);
 
   // ------------------------------------------------------------------ session
@@ -533,7 +632,8 @@ export default function App() {
       receivedTextEvents: 0,
     };
     statsDirtyRef.current = false;
-    turnRef.current = { userStartedAt: null, firstTextAt: null, firstAudioAt: null };
+    trackerRef.current.beginSession();
+    setSpeculative(false);
     micRecoveryRef.current = { lastAttemptAt: 0, attempts: 0 };
     playerRef.current.resetCounters();
     setTelemetry((prev) => ({
@@ -567,6 +667,7 @@ export default function App() {
           setStatus('ERROR');
           setUserSpeaking(false);
           setAgentThinking(false);
+          setSpeculative(false);
           playerRef.current.flush();
         },
         onWarning: (code, message) => {
@@ -575,14 +676,26 @@ export default function App() {
         onClose: ({ code, reason, willReconnect }) => {
           setUserSpeaking(false);
           setAgentThinking(false);
+          setSpeculative(false);
           playerRef.current.flush();
+          trackerRef.current.endSession();
           if (!willReconnect) {
             streamerRef.current.stopStreaming(true);
             sessionStartedRef.current = false;
             if (code !== 1000) {
-              setNoticeMessage(
-                `Session ended (code ${code}${reason ? `: ${reason}` : ''}). Press Start to open a new session.`
-              );
+              const base = `Session ended (code ${code}${reason ? `: ${reason}` : ''}).`;
+              setNoticeMessage(`${base} Press Start to open a new session.`);
+              // Diagnose the transport: a non-101 answer from an edge/proxy looks
+              // exactly like a failed WebSocket in the browser (code 1006, no
+              // detail). Probe over HTTP to name the real cause.
+              if (code === 1006 || code === 4000) {
+                void probeAgentUpgrade(
+                  `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/api/agent-proxy`
+                ).then((probe) => {
+                  setErrorMessage(`${base} ${probe.message}`);
+                  logEvent('TransportDiagnosis', 'connection', probe);
+                });
+              }
             }
           }
         },
@@ -686,6 +799,9 @@ export default function App() {
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         onRefreshHealth={checkHealth}
+        healthState={healthState}
+        healthHttpStatus={healthHttpStatus}
+        healthMessage={healthMessage}
       />
 
       {/* Standalone Window Banner Notification */}
@@ -709,7 +825,9 @@ export default function App() {
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
-        {health && !health.deepgramApiKeyConfigured && <ApiKeyWarningBanner onRefreshHealth={checkHealth} />}
+        {healthState === 'ready' && health && !health.deepgramApiKeyConfigured && (
+          <ApiKeyWarningBanner onRefreshHealth={checkHealth} />
+        )}
 
         {activeTab === 'prototype-1' ? (
           <div className="space-y-6">
@@ -723,6 +841,10 @@ export default function App() {
                 onStopSession={handleStopSession}
                 errorMessage={errorMessage}
                 noticeMessage={noticeMessage}
+                healthState={healthState}
+                healthHttpStatus={healthHttpStatus}
+                healthMessage={healthMessage}
+                onRefreshHealth={() => void checkHealth()}
               />
 
               <MicrophonePanel
@@ -746,6 +868,7 @@ export default function App() {
                 onClearMessages={() => setMessages([])}
                 onInjectText={handleInjectText}
                 isConnected={status === 'READY'}
+                speculative={speculative}
               />
 
               <DiagnosticsPanel events={events} onClearEvents={() => setEvents([])} />

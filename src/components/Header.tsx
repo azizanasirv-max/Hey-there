@@ -1,12 +1,15 @@
 import React from 'react';
 import { Radio, Server, CheckCircle2, AlertTriangle, ExternalLink } from 'lucide-react';
-import { BackendHealthResponse } from '../types/deepgram';
+import { BackendHealthResponse, BackendHealthState } from '../types/deepgram';
 
 interface HeaderProps {
   health: BackendHealthResponse | null;
   activeTab: string;
   setActiveTab: (tab: 'prototype-1' | 'architecture') => void;
   onRefreshHealth: () => void;
+  healthState?: BackendHealthState;
+  healthHttpStatus?: number | null;
+  healthMessage?: string | null;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -14,6 +17,9 @@ export const Header: React.FC<HeaderProps> = ({
   activeTab,
   setActiveTab,
   onRefreshHealth,
+  healthState = 'unknown',
+  healthHttpStatus = null,
+  healthMessage = null,
 }) => {
   const isKeyConfigured = health?.deepgramApiKeyConfigured ?? false;
   const standaloneUrl = typeof window !== 'undefined' ? `${window.location.origin}/prototype-1` : '/prototype-1';
@@ -81,17 +87,19 @@ export const Header: React.FC<HeaderProps> = ({
             {/* Backend Health Badge */}
             <button
               onClick={onRefreshHealth}
-              title="Click to re-check backend health status"
+              title={healthMessage || 'Click to re-check backend health status'}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold border transition-all cursor-pointer ${
-                health?.status === 'ok'
+                healthState === 'ready'
                   ? isKeyConfigured
                     ? 'bg-emerald-950/40 border-emerald-800/60 text-emerald-400 hover:bg-emerald-900/40'
                     : 'bg-amber-950/40 border-amber-800/60 text-amber-400 hover:bg-amber-900/40'
+                  : healthState === 'starting'
+                  ? 'bg-cyan-950/40 border-cyan-800/60 text-cyan-300 hover:bg-cyan-900/40'
                   : 'bg-rose-950/40 border-rose-800/60 text-rose-400 hover:bg-rose-900/40'
               }`}
             >
               <Server className="w-3.5 h-3.5" />
-              {health?.status === 'ok' ? (
+              {healthState === 'ready' ? (
                 isKeyConfigured ? (
                   <span className="flex items-center gap-1 font-semibold">
                     <CheckCircle2 className="w-3 h-3 text-emerald-400" />
@@ -103,8 +111,17 @@ export const Header: React.FC<HeaderProps> = ({
                     Key Missing
                   </span>
                 )
+              ) : healthState === 'starting' ? (
+                <span className="flex items-center gap-1 font-semibold" title={healthMessage || undefined}>
+                  <span className="w-2 h-2 rounded-full bg-cyan-300 animate-pulse" />
+                  Backend starting{healthHttpStatus ? ` (HTTP ${healthHttpStatus})` : ''}
+                </span>
+              ) : healthState === 'unknown' ? (
+                <span className="font-semibold text-slate-300">Checking backend…</span>
               ) : (
-                <span className="font-semibold">Backend Offline</span>
+                <span className="font-semibold" title={healthMessage || undefined}>
+                  {healthHttpStatus ? `Backend HTTP ${healthHttpStatus}` : 'Backend Offline'}
+                </span>
               )}
             </button>
 

@@ -1,4 +1,7 @@
 import type { AgentModelConfig } from '../shared/voiceAgentConfig';
+import type { ConversationMessage, ConversationalBehavior } from '../utils/conversation';
+
+export type { ConversationMessage, ConversationalBehavior };
 
 export type ConnectionStatus =
   | 'DISCONNECTED'
@@ -10,14 +13,6 @@ export type ConnectionStatus =
   | 'ERROR';
 
 export type Role = 'user' | 'assistant' | 'system';
-
-export interface ConversationMessage {
-  id: string;
-  role: Role;
-  content: string;
-  timestamp: string;
-  isFinal?: boolean;
-}
 
 /** Model configuration — single definition shared with the proxy. */
 export type ModelConfig = AgentModelConfig;
@@ -33,6 +28,21 @@ export interface DeepgramEvent {
 export interface LatencyMetrics {
   /** Client: first agent transcript after the user started speaking (ms). */
   speechStartToFirstTextMs: number | null;
+  /** Confirmed end-of-turn (or AgentThinking) -> first assistant text (ms). */
+  eotToFirstTextMs: number | null;
+  /** Confirmed end-of-turn -> first assistant audio frame (ms). */
+  eotToFirstAudioMs: number | null;
+  /**
+   * First assistant text -> first assistant audio frame (ms).
+   * Positive means the text was displayed BEFORE the audio started arriving.
+   */
+  firstTextToFirstAudioMs: number | null;
+  /** Eager end-of-turn -> confirmed end of turn (speculative window, ms). */
+  speculativeWindowMs: number | null;
+  /** How much earlier the draft could start thanks to the eager trigger (ms). */
+  speculativeGainMs: number | null;
+  /** Number of times the user resumed speaking inside the speculative window. */
+  turnResumes: number;
   /** Client: user speech start -> first agent audio frame playable (ms). */
   speechStartToFirstAudioMs: number | null;
   /** Client: first agent audio frame -> it actually becoming audible (ms). */
@@ -84,6 +94,12 @@ export interface SessionTelemetry {
 
 export const EMPTY_LATENCY: LatencyMetrics = {
   speechStartToFirstTextMs: null,
+  eotToFirstTextMs: null,
+  eotToFirstAudioMs: null,
+  firstTextToFirstAudioMs: null,
+  speculativeWindowMs: null,
+  speculativeGainMs: null,
+  turnResumes: 0,
   speechStartToFirstAudioMs: null,
   firstAudioBufferingMs: null,
   settingsToFirstAudioMs: null,
@@ -93,6 +109,9 @@ export const EMPTY_LATENCY: LatencyMetrics = {
   ttsMs: null,
   totalMs: null,
 };
+
+/** UI-level backend state derived from the HTTP status contract. */
+export type BackendHealthState = 'unknown' | 'ready' | 'starting' | 'unavailable' | 'error';
 
 export interface BackendHealthResponse {
   status: string;

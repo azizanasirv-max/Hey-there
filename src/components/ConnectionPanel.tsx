@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Play, Square, Settings, Cpu, Mic, Volume2, ShieldCheck, Zap, ChevronDown, ChevronUp } from 'lucide-react';
-import { ConnectionStatus, ModelConfig, BackendHealthResponse } from '../types/deepgram';
+import { ConnectionStatus, ModelConfig, BackendHealthResponse, BackendHealthState } from '../types/deepgram';
 import { DEFAULT_TURN_DETECTION, isFluxListenModel } from '../shared/voiceAgentConfig';
 
 interface ConnectionPanelProps {
@@ -12,6 +12,10 @@ interface ConnectionPanelProps {
   onStopSession: () => void;
   errorMessage: string | null;
   noticeMessage?: string | null;
+  healthState?: BackendHealthState;
+  healthHttpStatus?: number | null;
+  healthMessage?: string | null;
+  onRefreshHealth?: () => void;
 }
 
 export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
@@ -23,6 +27,10 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
   onStopSession,
   errorMessage,
   noticeMessage,
+  healthState = 'unknown',
+  healthHttpStatus = null,
+  healthMessage = null,
+  onRefreshHealth,
 }) => {
   const [showConfigOptions, setShowConfigOptions] = useState(false);
 
@@ -75,6 +83,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
     }
   };
 
+  const canStart = healthState === 'ready' && Boolean(health?.deepgramApiKeyConfigured);
   const isConnected =
     status === 'READY' ||
     status === 'CONNECTING' ||
@@ -104,9 +113,16 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
         {!isConnected ? (
           <button
             onClick={onStartSession}
-            disabled={!health?.deepgramApiKeyConfigured}
+            disabled={!canStart}
+            title={
+              canStart
+                ? 'Start a Voice Agent session'
+                : healthState === 'starting'
+                ? 'Backend is starting (HTTP 202 accepted) — retrying automatically'
+                : healthMessage || 'Backend is not ready'
+            }
             className={`flex-1 flex items-center justify-center gap-2 py-3 px-5 rounded-lg font-bold text-sm transition-all shadow-lg ${
-              health?.deepgramApiKeyConfigured
+              canStart
                 ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-slate-950 hover:from-cyan-400 hover:to-blue-500 shadow-cyan-500/20 active:scale-[0.99] cursor-pointer'
                 : 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700'
             }`}
@@ -134,6 +150,39 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
           {showConfigOptions ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
         </button>
       </div>
+
+      {healthState !== 'ready' && (
+        <div
+          className={`p-3 rounded-lg text-xs font-mono border ${
+            healthState === 'starting'
+              ? 'bg-cyan-950/40 border-cyan-800/70 text-cyan-200'
+              : healthState === 'unknown'
+              ? 'bg-slate-950/60 border-slate-800 text-slate-300'
+              : 'bg-rose-950/40 border-rose-800/70 text-rose-200'
+          }`}
+        >
+          <div className="flex items-start justify-between gap-3">
+            <span>
+              <span className="font-bold">
+                {healthState === 'starting'
+                  ? `Backend accepted the request asynchronously (HTTP ${healthHttpStatus ?? 202})`
+                  : healthState === 'unknown'
+                  ? 'Checking backend…'
+                  : `Backend not ready${healthHttpStatus ? ` (HTTP ${healthHttpStatus})` : ''}`}
+              </span>
+              {healthMessage ? ` — ${healthMessage}` : ''}
+            </span>
+            {onRefreshHealth && (
+              <button
+                onClick={onRefreshHealth}
+                className="shrink-0 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold"
+              >
+                Retry now
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {errorMessage && (
         <div className="p-3 bg-rose-950/50 border border-rose-800/80 rounded-lg text-xs text-rose-300 font-mono">
@@ -200,7 +249,18 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
               <label className="block text-slate-400 mb-1">Listening Model (STT)</label>
               <select
                 value={modelConfig.listenModel}
-                onChange={(e) => setModelConfig({ ...modelConfig, listenModel: e.target.value })}
+                onChange={(e) => {
+                  const listenModel = e.target.value;
+                  // Flux (v2) is the only family with end-of-turn tuning, so it is
+                  // enabled by default there and dropped for nova (v1).
+                  setModelConfig({
+                    ...modelConfig,
+                    listenModel,
+                    turnDetection: isFluxListenModel(listenModel)
+                      ? modelConfig.turnDetection || { ...DEFAULT_TURN_DETECTION }
+                      : undefined,
+                  });
+                }}
                 className="w-full bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-slate-200 font-mono focus:border-cyan-500 outline-none"
               >
                 <option value="nova-3">nova-3 (Recommended Default)</option>
@@ -217,11 +277,16 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
                 onChange={(e) => setModelConfig({ ...modelConfig, thinkModel: e.target.value })}
                 className="w-full bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-slate-200 font-mono focus:border-cyan-500 outline-none"
               >
-                <option value="gpt-4o-mini">gpt-4o-mini (Recommended Default)</option>
+                <option value="gpt-4o-mini">gpt-4o-mini (Recommended Default — lowest latency)</option>
+                <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+                <option value="gpt-4.1-nano">gpt-4.1-nano</option>
                 <option value="gpt-4o">gpt-4o</option>
-                <option value="claude-3-5-sonnet">claude-3-5-sonnet</option>
-                <option value="llama-3.3-70b-instruct">llama-3.3-70b-instruct</option>
+                <option value="gpt-5-mini">gpt-5-mini</option>
               </select>
+              <p className="text-[10px] text-slate-500 mt-1">
+                Only models the <span className="font-mono">open_ai</span> provider accepts are listed; anything
+                else is rejected by Deepgram with INVALID_SETTINGS.
+              </p>
             </div>
 
             <div>

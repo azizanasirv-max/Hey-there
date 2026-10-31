@@ -68,6 +68,29 @@ export const TelemetryPanel: React.FC<TelemetryPanelProps> = ({ telemetry, playe
 
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <div className="bg-slate-950/70 p-2.5 rounded-lg border border-slate-800 flex items-center justify-between">
+            <span className="text-[10px] text-slate-400">Text → audio</span>
+            <span
+              className={`text-xs font-bold font-mono ${
+                (latency.firstTextToFirstAudioMs ?? 0) > 0 ? 'text-emerald-300' : 'text-slate-200'
+              }`}
+              title="Positive = the transcript was displayed before the first audio frame arrived"
+            >
+              {formatMs(latency.firstTextToFirstAudioMs)}
+            </span>
+          </div>
+          <div className="bg-slate-950/70 p-2.5 rounded-lg border border-slate-800 flex items-center justify-between">
+            <span className="text-[10px] text-slate-400">End-of-turn → text</span>
+            <span className="text-xs font-bold text-slate-200 font-mono">{formatMs(latency.eotToFirstTextMs)}</span>
+          </div>
+          <div className="bg-slate-950/70 p-2.5 rounded-lg border border-slate-800 flex items-center justify-between">
+            <span className="text-[10px] text-slate-400">Speculative gain</span>
+            <span className="text-xs font-bold text-violet-300 font-mono">{formatMs(latency.speculativeGainMs)}</span>
+          </div>
+          <div className="bg-slate-950/70 p-2.5 rounded-lg border border-slate-800 flex items-center justify-between">
+            <span className="text-[10px] text-slate-400">Turn resumes</span>
+            <span className="text-xs font-bold text-slate-200 font-mono">{latency.turnResumes}</span>
+          </div>
+          <div className="bg-slate-950/70 p-2.5 rounded-lg border border-slate-800 flex items-center justify-between">
             <span className="text-[10px] text-slate-400">STT</span>
             <span className="text-xs font-bold text-slate-200 font-mono">{formatMs(latency.sttMs)}</span>
           </div>
@@ -88,7 +111,8 @@ export const TelemetryPanel: React.FC<TelemetryPanelProps> = ({ telemetry, playe
         </div>
         <p className="text-[10px] text-slate-500">
           STT / LLM / TTS / total come from Deepgram's per-turn <code className="text-slate-400">LatencyReport</code>{' '}
-          event; the other four are measured in this browser and the local proxy.
+          event; the rest are measured in this browser and the local proxy. <strong>Text → audio</strong> is positive
+          when the transcript was shown before the first audio frame arrived (text and playback are independent).
         </p>
       </div>
 

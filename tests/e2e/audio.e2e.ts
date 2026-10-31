@@ -124,6 +124,95 @@ async function main() {
     const counterGrew = await waitFor(async () => /(?:^|\D)([1-9]\d*)\s*frames/.test(await readAgentCounter()), 8000, 'agent frame counter');
     check('agent audio frame counter is non-zero', counterGrew, (await readAgentCounter()).replace(/\s+/g, ' '));
 
+    // ------------------------------------- 3b. ConversationText is displayed immediately
+    const countOccurrences = async (needle: string) =>
+      page.evaluate((n) => document.body.innerText.split(n).length - 1, needle);
+
+    // (a) user transcript
+    upstream.sendJson({ type: 'ConversationText', role: 'user', content: 'E2E user transcript' });
+    const userTextShown = await waitFor(async () => (await pageText(page)).includes('E2E user transcript'), 4000, 'user transcript');
+    check('user ConversationText is displayed immediately', userTextShown);
+
+    // Measure the real "event -> visible text" latency (rAF polling, 6 samples).
+    const displayLatencies: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      const marker = `E2E latency probe ${i}`;
+      const sentAt = Date.now();
+      upstream.sendJson({ type: 'ConversationText', role: 'assistant', content: marker });
+      await page.waitForFunction((m) => document.body.innerText.includes(m), { polling: 'raf', timeout: 5000 }, marker);
+      displayLatencies.push(Date.now() - sentAt);
+    }
+    const sortedDisplay = [...displayLatencies].sort((a, b) => a - b);
+    const p50 = sortedDisplay[Math.floor(sortedDisplay.length / 2)];
+    console.log(`[latency] ConversationText -> painted text: p50=${p50} ms, samples=${sortedDisplay.join(',')} ms`);
+    check('ConversationText is painted within 250 ms of arrival', p50 <= 250, `p50=${p50} ms`);
+
+    // (b) assistant text BEFORE AgentAudioDone and while audio is still streaming
+    upstream.sendJson({ type: 'AgentThinking', content: 'thinking' });
+    upstream.sendJson({
+      type: 'ConversationText',
+      role: 'assistant',
+      content: 'E2E assistant answer appears before audio finishes',
+    });
+    const assistantTextShown = await waitFor(
+      async () => (await pageText(page)).includes('E2E assistant answer appears before audio finishes'),
+      4000,
+      'assistant transcript'
+    );
+    check('assistant ConversationText is displayed immediately', assistantTextShown);
+
+    // Audio keeps arriving while the text is already on screen.
+    for (let i = 0; i < 20; i++) {
+      upstream.sendBinary(Buffer.alloc(960, 0x22));
+      await delay(20);
+    }
+    const stillVisible = (await pageText(page)).includes('E2E assistant answer appears before audio finishes');
+    check('assistant text stays visible while audio is playing', stillVisible);
+    check(
+      'text was displayed before AgentAudioDone',
+      stillVisible && !(await pageText(page)).includes('AgentAudioDone') === true
+    );
+
+    upstream.sendJson({ type: 'AgentAudioDone' });
+    await delay(300);
+    check('assistant text survives AgentAudioDone', (await pageText(page)).includes('E2E assistant answer appears before audio finishes'));
+
+    // (c) audio-then-text ordering must also work
+    for (let i = 0; i < 5; i++) upstream.sendBinary(Buffer.alloc(960, 0x33));
+    upstream.sendJson({ type: 'ConversationText', role: 'assistant', content: 'E2E text after audio' });
+    const afterAudio = await waitFor(async () => (await pageText(page)).includes('E2E text after audio'), 4000, 'text after audio');
+    check('ConversationText arriving after audio is still displayed', afterAudio);
+
+    // (d) duplicates are suppressed
+    upstream.sendJson({ type: 'ConversationText', role: 'assistant', content: 'E2E duplicate guard' });
+    await waitFor(async () => (await pageText(page)).includes('E2E duplicate guard'), 4000, 'duplicate guard baseline');
+    upstream.sendJson({ type: 'ConversationText', role: 'assistant', content: 'E2E duplicate guard' });
+    upstream.sendJson({ type: 'ConversationText', role: 'assistant', content: 'E2E duplicate guard' });
+    await delay(700);
+    const duplicateCount = await countOccurrences('E2E duplicate guard');
+    check('duplicate ConversationText is rendered once', duplicateCount === 1, `${duplicateCount} occurrences`);
+
+    // (e) Flux eager end-of-turn lifecycle
+    upstream.sendJson({ type: 'EagerEndOfTurn', transcript: 'drafting' });
+    const speculativeShown = await waitFor(async () => (await pageText(page)).includes('Eager end-of-turn'), 4000, 'speculative badge');
+    check('EagerEndOfTurn surfaces a speculative state', speculativeShown);
+
+    upstream.sendJson({ type: 'TurnResumed' });
+    const speculativeCleared = await waitFor(
+      async () => !(await pageText(page)).includes('Eager end-of-turn'),
+      4000,
+      'speculative badge cleared'
+    );
+    check('TurnResumed cancels the speculative state', speculativeCleared);
+    check('TurnResumed does not fabricate an assistant reply', !(await pageText(page)).includes('drafting'));
+
+    upstream.sendJson({ type: 'EagerEndOfTurn' });
+    await delay(300);
+    upstream.sendJson({ type: 'EndOfTurn' });
+    upstream.sendJson({ type: 'ConversationText', role: 'assistant', content: 'E2E finalized answer' });
+    const finalized = await waitFor(async () => (await pageText(page)).includes('E2E finalized answer'), 4000, 'finalized answer');
+    check('EndOfTurn finalizes exactly one assistant reply', finalized && (await countOccurrences('E2E finalized answer')) === 1);
+
     // ------------------------------------------------------------- 4. mute behaviour
     await page.click('button::-p-text(Mute Mic)');
     await delay(300);

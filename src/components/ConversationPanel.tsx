@@ -9,6 +9,8 @@ interface ConversationPanelProps {
   onClearMessages: () => void;
   onInjectText?: (text: string) => void;
   isConnected: boolean;
+  /** Flux speculative window is open (eager end-of-turn received). */
+  speculative?: boolean;
 }
 
 export const ConversationPanel: React.FC<ConversationPanelProps> = ({
@@ -18,6 +20,7 @@ export const ConversationPanel: React.FC<ConversationPanelProps> = ({
   onClearMessages,
   onInjectText,
   isConnected,
+  speculative = false,
 }) => {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
@@ -112,6 +115,14 @@ export const ConversationPanel: React.FC<ConversationPanelProps> = ({
                       <span>{isUser ? 'Customer Speech' : 'Deepgram Voice AI'}</span>
                       <span>·</span>
                       <span>{msg.timestamp}</span>
+                      {typeof msg.turnId === 'number' && msg.turnId > 0 && (
+                        <span className="text-slate-600">turn {msg.turnId}</span>
+                      )}
+                      {msg.behavior && msg.behavior !== 'default' && (
+                        <span className="text-[10px] text-amber-400/80 border border-amber-500/30 rounded px-1">
+                          {msg.behavior}
+                        </span>
+                      )}
                     </div>
 
                     <div
@@ -133,6 +144,17 @@ export const ConversationPanel: React.FC<ConversationPanelProps> = ({
               <div className="flex items-center gap-2.5 p-3 rounded-xl bg-cyan-950/40 border border-cyan-800/60 text-cyan-300 text-xs font-medium animate-pulse">
                 <Mic className="w-4 h-4 text-cyan-400 shrink-0" />
                 <span>Customer is speaking... Deepgram nova-3 listening in real time.</span>
+              </div>
+            )}
+
+            {/* Speculative (eager end-of-turn) badge */}
+            {speculative && (
+              <div className="flex items-center gap-2.5 p-3 rounded-xl bg-violet-950/40 border border-violet-800/60 text-violet-200 text-xs font-medium">
+                <Sparkles className="w-4 h-4 text-violet-300 shrink-0 animate-pulse" />
+                <span>
+                  Eager end-of-turn — drafting a reply before the turn is confirmed. If you keep talking, the draft is
+                  discarded automatically.
+                </span>
               </div>
             )}
 

@@ -9,7 +9,7 @@ import {
   AgentModelConfig,
   DEFAULT_AGENT_CONFIG,
   DEFAULT_AGENT_WS_URL,
-  buildAgentSettingsMessage,
+  buildValidatedSettings,
   normalizeAgentConfig,
 } from './src/shared/voiceAgentConfig';
 
@@ -58,6 +58,10 @@ async function startServer() {
 
   // Health endpoint for backend & API key status verification
   app.get('/api/health', (req, res) => {
+    // Never let an intermediary cache a readiness probe: a cached 200/202
+    // is indistinguishable from a live backend.
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.set('X-Agent-Proxy', 'deepgram-voice-agent');
     const rawKey = process.env.DEEPGRAM_API_KEY;
     const hasApiKey = Boolean(rawKey && rawKey.trim().length > 0 && !rawKey.includes('your_actual'));
     const maskedKey = hasApiKey ? `${rawKey!.trim().substring(0, 4)}...${rawKey!.trim().slice(-4)}` : null;
@@ -185,15 +189,24 @@ async function startServer() {
         settingsWaitTimer = null;
       }
 
-      const payload = buildAgentSettingsMessage(modelConfig);
+      // Validate + repair before sending, so a stale/invalid model id can never
+      // turn into a fatal `INVALID_SETTINGS` error mid-session.
+      const validated = buildValidatedSettings(modelConfig);
+      const payload = validated.settings;
+      modelConfig = validated.config;
+      for (const warning of validated.warnings) {
+        console.warn(`[Proxy] Settings corrected: ${warning}`);
+        sendClient({ type: 'Warning', code: 'SETTINGS_CORRECTED', description: warning });
+      }
       settingsMessageSent = true;
       settingsSentAt = { at: nowMs(), label: 'settings-sent' };
       deepgramWs.send(JSON.stringify(payload));
       console.log(`[Proxy -> Deepgram] Settings sent (${reason}): ${JSON.stringify(modelConfig)}`);
-      sendClient({ type: 'ProxyStatus', status: 'SettingsSent', settings: payload });
+      sendClient({ type: 'ProxyStatus', status: 'SettingsSent', settings: payload, warnings: validated.warnings });
     };
 
     const applyClientConfig = (rawConfig: unknown) => {
+      // Values are normalized here and validated right before `Settings` is sent.
       modelConfig = normalizeAgentConfig(rawConfig, DEFAULT_AGENT_CONFIG);
       clientConfigReceived = true;
       console.log('[Proxy] Model configuration received from browser:', modelConfig);
@@ -409,7 +422,9 @@ async function startServer() {
             break;
           }
           case 'KeepAlive':
-            if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN) {
+            // Protocol rule: nothing except `Settings` may be sent before
+            // `SettingsApplied` (`NON_SETTINGS_MESSAGE_BEFORE_SETTINGS`).
+            if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN && isSettingsApplied) {
               deepgramWs.send(JSON.stringify({ type: 'KeepAlive' }));
               lastClientAudioAt = nowMs();
             }
@@ -422,6 +437,12 @@ async function startServer() {
         }
       } catch (err) {
         console.error('[Proxy] Failed to parse browser text message:', err);
+        sendClient({
+          type: 'Warning',
+          code: 'MALFORMED_CLIENT_MESSAGE',
+          description:
+            'A client message was not valid JSON and was dropped. The proxy never forwards unparsable frames upstream.',
+        });
       }
     });
 
@@ -488,6 +509,34 @@ async function startServer() {
     clientWs.on('error', (err) => {
       console.error('[Proxy] Client socket error:', err.message);
       cleanup('client error');
+    });
+  });
+
+  // ---------------------------------------------------------------- HTTP routes
+  //
+  // Explicit API guards *before* the SPA fallback. Without these, a plain HTTP
+  // request to the WebSocket endpoint (or a typo'd API path) is answered with
+  // `200 text/html` (the SPA), which hides routing/proxy misconfiguration and
+  // looks like a successful API call to any client that only checks `res.ok`.
+  app.all('/api/agent-proxy', (req, res) => {
+    // RFC 7231 §6.5.15: the resource only exists over an upgraded connection.
+    // 426 is the correct answer to an HTTP request that cannot be upgraded — not
+    // 200, and not 202 (202 would imply we accepted it asynchronously).
+    res.set('Cache-Control', 'no-store');
+    res.set('Upgrade', 'websocket');
+    res.status(426).json({
+      error: 'UPGRADE_REQUIRED',
+      message:
+        'This endpoint only accepts a WebSocket upgrade (HTTP 101 Switching Protocols). ' +
+        'Use ws:// or wss:// — a plain HTTP GET cannot open a Voice Agent session.',
+    });
+  });
+
+  app.all('/api/*', (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.status(404).json({
+      error: 'NOT_FOUND',
+      message: `No such API route: ${req.method} ${req.path}`,
     });
   });
 
