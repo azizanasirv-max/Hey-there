@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Play, Square, Settings, Cpu, Mic, Volume2, ShieldCheck, Zap, ChevronDown, ChevronUp } from 'lucide-react';
 import { ConnectionStatus, ModelConfig, BackendHealthResponse } from '../types/deepgram';
+import { DEFAULT_TURN_DETECTION, isFluxListenModel } from '../shared/voiceAgentConfig';
 
 interface ConnectionPanelProps {
   status: ConnectionStatus;
@@ -10,6 +11,7 @@ interface ConnectionPanelProps {
   onStartSession: () => void;
   onStopSession: () => void;
   errorMessage: string | null;
+  noticeMessage?: string | null;
 }
 
 export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
@@ -20,6 +22,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
   onStartSession,
   onStopSession,
   errorMessage,
+  noticeMessage,
 }) => {
   const [showConfigOptions, setShowConfigOptions] = useState(false);
 
@@ -30,6 +33,13 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
             <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
             Session Ready (Streaming Active)
+          </span>
+        );
+      case 'RECONNECTING':
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/30">
+            <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+            Reconnecting (audio kept open)
           </span>
         );
       case 'CONNECTING':
@@ -65,7 +75,12 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
     }
   };
 
-  const isConnected = status === 'READY' || status === 'CONNECTING' || status === 'WAITING_FOR_WELCOME' || status === 'SETTINGS_SENT';
+  const isConnected =
+    status === 'READY' ||
+    status === 'CONNECTING' ||
+    status === 'WAITING_FOR_WELCOME' ||
+    status === 'SETTINGS_SENT' ||
+    status === 'RECONNECTING';
 
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl space-y-5">
@@ -123,6 +138,12 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
       {errorMessage && (
         <div className="p-3 bg-rose-950/50 border border-rose-800/80 rounded-lg text-xs text-rose-300 font-mono">
           <span className="font-bold text-rose-200">Error:</span> {errorMessage}
+        </div>
+      )}
+
+      {noticeMessage && !errorMessage && (
+        <div className="p-3 bg-amber-950/40 border border-amber-800/70 rounded-lg text-xs text-amber-200 font-mono">
+          <span className="font-bold text-amber-100">Notice:</span> {noticeMessage}
         </div>
       )}
 
@@ -185,6 +206,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
                 <option value="nova-3">nova-3 (Recommended Default)</option>
                 <option value="nova-2">nova-2</option>
                 <option value="nova-2-general">nova-2-general</option>
+                <option value="flux-general-en">flux-general-en (Flux v2 — lowest turn latency)</option>
               </select>
             </div>
 
@@ -216,6 +238,33 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
               </select>
             </div>
           </div>
+
+          {isFluxListenModel(modelConfig.listenModel) ? (
+            <label className="flex items-start gap-2 p-2.5 bg-slate-900/70 rounded border border-slate-800 text-[11px] text-slate-300 cursor-pointer">
+              <input
+                type="checkbox"
+                className="mt-0.5 accent-cyan-500"
+                checked={Boolean(modelConfig.turnDetection)}
+                onChange={(e) =>
+                  setModelConfig({
+                    ...modelConfig,
+                    turnDetection: e.target.checked ? { ...DEFAULT_TURN_DETECTION } : undefined,
+                  })
+                }
+              />
+              <span>
+                <span className="font-semibold text-slate-200">Low-latency turn detection</span> — eager end-of-turn{' '}
+                {DEFAULT_TURN_DETECTION.eagerEotThreshold} / eot {DEFAULT_TURN_DETECTION.eotThreshold} /{' '}
+                {DEFAULT_TURN_DETECTION.eotTimeoutMs} ms cap, so the agent starts thinking before the user's turn is
+                fully confirmed (speculative replies).
+              </span>
+            </label>
+          ) : (
+            <p className="text-[11px] text-slate-500 leading-relaxed">
+              End-of-turn tuning (<code className="text-slate-400">eot_*</code>) is only accepted by Flux (v2) listen
+              models. Select <span className="font-mono text-slate-400">flux-general-en</span> to enable it.
+            </p>
+          )}
         </div>
       )}
 

@@ -33,7 +33,7 @@ export const DiagnosticsPanel: React.FC<DiagnosticsPanelProps> = ({
     if (type === 'SettingsApplied' || type === 'Welcome') {
       return <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />;
     }
-    if (category === 'audio' || type === 'AudioDiscardedTelemetry') {
+    if (category === 'audio' || type === 'LatencyReport' || type === 'AgentAudioStats') {
       return <VolumeX className="w-3.5 h-3.5 text-cyan-400 shrink-0" />;
     }
     return <Info className="w-3.5 h-3.5 text-blue-400 shrink-0" />;
@@ -85,7 +85,7 @@ export const DiagnosticsPanel: React.FC<DiagnosticsPanelProps> = ({
                 filter === 'audio' ? 'bg-slate-800 text-emerald-300 font-bold' : 'text-slate-400 hover:text-slate-200'
               }`}
             >
-              Audio Discard
+              Audio / Latency
             </button>
             <button
               onClick={() => setFilter('errors')}
