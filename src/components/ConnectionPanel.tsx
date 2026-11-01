@@ -91,6 +91,23 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
     status === 'SETTINGS_SENT' ||
     status === 'RECONNECTING';
 
+  /**
+   * Why the Start button is disabled. A disabled button with only a `title`
+   * tooltip is a dead end on touch devices, so the reason is always rendered
+   * next to it (and wired to the button with `aria-describedby`).
+   */
+  const startBlockedReason = canStart
+    ? null
+    : healthState === 'starting'
+    ? `Waiting for the backend to finish starting (HTTP ${healthHttpStatus ?? 202} accepted). This retries automatically.`
+    : healthState === 'unknown'
+    ? 'Checking backend health…'
+    : healthState === 'ready'
+    ? 'DEEPGRAM_API_KEY is not configured on the server. Add it to the environment and restart/redeploy.'
+    : `Backend not ready${healthHttpStatus ? ` (HTTP ${healthHttpStatus})` : ''}${
+        healthMessage ? ` — ${healthMessage}` : ''
+      }`;
+
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl space-y-5">
       
@@ -114,20 +131,15 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
           <button
             onClick={onStartSession}
             disabled={!canStart}
-            title={
-              canStart
-                ? 'Start a Voice Agent session'
-                : healthState === 'starting'
-                ? 'Backend is starting (HTTP 202 accepted) — retrying automatically'
-                : healthMessage || 'Backend is not ready'
-            }
+            aria-describedby={startBlockedReason ? 'start-blocked-reason' : undefined}
+            title={canStart ? 'Start a Voice Agent session' : startBlockedReason || 'Backend is not ready'}
             className={`flex-1 flex items-center justify-center gap-2 py-3 px-5 rounded-lg font-bold text-sm transition-all shadow-lg ${
               canStart
                 ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-slate-950 hover:from-cyan-400 hover:to-blue-500 shadow-cyan-500/20 active:scale-[0.99] cursor-pointer'
                 : 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700'
             }`}
           >
-            <Play className="w-4 h-4 fill-current" />
+            <Play className="w-4 h-4 fill-current" aria-hidden="true" />
             Start Voice Agent Session
           </button>
         ) : (
@@ -135,21 +147,34 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
             onClick={onStopSession}
             className="flex-1 flex items-center justify-center gap-2 py-3 px-5 rounded-lg font-bold text-sm bg-rose-600/90 hover:bg-rose-500 text-white transition-all shadow-lg shadow-rose-600/20 active:scale-[0.99] cursor-pointer"
           >
-            <Square className="w-4 h-4 fill-current" />
-            Stop Session & Clean Up
+            <Square className="w-4 h-4 fill-current" aria-hidden="true" />
+            Stop Session &amp; Clean Up
           </button>
         )}
 
         <button
           onClick={() => setShowConfigOptions(!showConfigOptions)}
           disabled={isConnected}
-          className="flex items-center justify-center gap-2 py-3 px-4 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors disabled:opacity-50"
+          aria-expanded={showConfigOptions && !isConnected}
+          aria-controls="model-config-panel"
+          title={
+            isConnected
+              ? 'Model settings are locked while a session is live — stop the session to change them.'
+              : 'Show or hide the Deepgram model configuration'
+          }
+          className="flex items-center justify-center gap-2 py-3 px-4 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
         >
-          <Settings className="w-4 h-4" />
+          <Settings className="w-4 h-4" aria-hidden="true" />
           <span>Config Models</span>
-          {showConfigOptions ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+          {showConfigOptions ? <ChevronUp className="w-3.5 h-3.5" aria-hidden="true" /> : <ChevronDown className="w-3.5 h-3.5" aria-hidden="true" />}
         </button>
       </div>
+
+      {startBlockedReason && !isConnected && (
+        <p id="start-blocked-reason" className="text-[11px] text-amber-300/90 bg-amber-950/30 border border-amber-900/60 rounded-lg px-3 py-2 leading-relaxed">
+          <span className="font-bold text-amber-200">Start is disabled:</span> {startBlockedReason}
+        </p>
+      )}
 
       {healthState !== 'ready' && (
         <div
@@ -174,8 +199,10 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
             </span>
             {onRefreshHealth && (
               <button
+                type="button"
                 onClick={onRefreshHealth}
-                className="shrink-0 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold"
+                aria-label="Re-check backend health now"
+                className="shrink-0 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold cursor-pointer"
               >
                 Retry now
               </button>
@@ -185,13 +212,17 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
       )}
 
       {errorMessage && (
-        <div className="p-3 bg-rose-950/50 border border-rose-800/80 rounded-lg text-xs text-rose-300 font-mono">
+        <div role="alert" className="p-3 bg-rose-950/50 border border-rose-800/80 rounded-lg text-xs text-rose-300 font-mono">
           <span className="font-bold text-rose-200">Error:</span> {errorMessage}
         </div>
       )}
 
       {noticeMessage && !errorMessage && (
-        <div className="p-3 bg-amber-950/40 border border-amber-800/70 rounded-lg text-xs text-amber-200 font-mono">
+        <div
+          role="status"
+          aria-live="polite"
+          className="p-3 bg-amber-950/40 border border-amber-800/70 rounded-lg text-xs text-amber-200 font-mono"
+        >
           <span className="font-bold text-amber-100">Notice:</span> {noticeMessage}
         </div>
       )}
@@ -240,7 +271,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
 
       {/* Collapsible Config Options */}
       {showConfigOptions && !isConnected && (
-        <div className="p-4 bg-slate-950/80 rounded-lg border border-slate-800 space-y-3">
+        <div id="model-config-panel" className="p-4 bg-slate-950/80 rounded-lg border border-slate-800 space-y-3">
           <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider">
             Deepgram Settings Configuration
           </h3>

@@ -7,6 +7,7 @@ import { DiagnosticsPanel } from './components/DiagnosticsPanel';
 import { TelemetryPanel } from './components/TelemetryPanel';
 import { ApiKeyWarningBanner } from './components/ApiKeyWarningBanner';
 import { ArchitectureView } from './components/ArchitectureView';
+import { StatusStrip } from './components/StatusStrip';
 import { AudioStreamer, AudioStreamerState, MicFailureReason } from './utils/audioStreamer';
 import { PcmAudioPlayer, PlayerStats } from './utils/audioPlayer';
 import { VoiceAgentSession } from './utils/voiceAgentSession';
@@ -25,7 +26,7 @@ import {
   EMPTY_LATENCY,
 } from './types/deepgram';
 import { DEFAULT_AGENT_CONFIG } from './shared/voiceAgentConfig';
-import { MonitorCheck } from 'lucide-react';
+import { ExternalLink } from 'lucide-react';
 
 
 /** How long the UI waits for a 202/204-accepted backend before surfacing an error. */
@@ -110,6 +111,7 @@ export default function App() {
   const [status, setStatus] = useState<ConnectionStatus>('DISCONNECTED');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [noticeMessage, setNoticeMessage] = useState<string | null>(null);
+  const [reconnectAttempt, setReconnectAttempt] = useState<number | null>(null);
 
   // Model Configuration (single source of truth, shared with the proxy)
   const [modelConfig, setModelConfig] = useState<ModelConfig>({ ...DEFAULT_AGENT_CONFIG });
@@ -648,10 +650,13 @@ export default function App() {
         onStatus: (next, info) => {
           setStatus(next as ConnectionStatus);
           if (next === 'RECONNECTING') {
+            setReconnectAttempt(info?.attempt ?? null);
             setNoticeMessage(
               `Connection lost (${info?.reason || 'transport'}). Reconnecting in ${info?.nextRetryMs ?? 0} ms ` +
                 `(attempt ${info?.attempt ?? 1}). The microphone stays open.`
             );
+          } else if (next === 'READY' || next === 'DISCONNECTED' || next === 'ERROR') {
+            setReconnectAttempt(null);
           }
         },
         onEvent: handleSessionEvent,
@@ -794,6 +799,11 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
+      {/* First tab stop: jump past the header straight to the working area. */}
+      <a href="#main-content" className="skip-link">
+        Skip to main content
+      </a>
+
       <Header
         health={health}
         activeTab={activeTab}
@@ -804,27 +814,58 @@ export default function App() {
         healthMessage={healthMessage}
       />
 
-      {/* Standalone Window Banner Notification */}
-      {!isIframe && (
-        <div className="bg-cyan-950/60 border-b border-cyan-800/80 px-4 py-2 text-xs text-cyan-200 flex items-center justify-between max-w-7xl mx-auto w-full">
-          <div className="flex items-center gap-2">
-            <MonitorCheck className="w-4 h-4 text-cyan-400 shrink-0" />
+      {/* Screen-reader live region: connection state changes are announced even
+          though the visual badges are spread across several panels. */}
+      <span className="sr-only" role="status" aria-live="polite">
+        {status === 'READY'
+          ? 'Voice agent session ready. Microphone streaming.'
+          : status === 'RECONNECTING'
+          ? `Connection lost. Reconnecting${reconnectAttempt ? `, attempt ${reconnectAttempt}` : ''}.`
+          : status === 'ERROR'
+          ? `Session error. ${errorMessage || ''}`
+          : status === 'DISCONNECTED'
+          ? 'Voice agent session stopped.'
+          : status === 'CONNECTING' || status === 'WAITING_FOR_WELCOME' || status === 'SETTINGS_SENT'
+          ? 'Connecting to the voice agent.'
+          : ''}
+      </span>
+
+      {/* Embedded-preview warning: inside an iframe the browser can block the
+          microphone, so this banner only appears when it can actually bite. */}
+      {isIframe && (
+        <div className="bg-amber-950/70 border-b border-amber-800/80 px-4 py-2 text-xs text-amber-100">
+          <div className="flex flex-wrap items-center gap-2 max-w-7xl mx-auto w-full">
             <span>
-              <strong>Standalone Browser Page Active</strong> — Running directly at{' '}
-              <code className="text-cyan-300 font-mono">
-                {typeof window !== 'undefined' ? window.location.pathname : '/prototype-1'}
-              </code>{' '}
-              outside embedded preview iframe. Live microphone streaming and agent voice playback enabled.
+              <strong>Embedded preview detected.</strong> Browsers often block microphone access inside an iframe —
+              open the app in its own tab to start a real session.
             </span>
+            <a
+              href={typeof window !== 'undefined' ? `${window.location.origin}/prototype-1` : '/prototype-1'}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 font-bold text-amber-100"
+            >
+              <ExternalLink className="w-3.5 h-3.5" aria-hidden="true" />
+              Open standalone
+            </a>
           </div>
-          <span className="text-[10px] font-mono text-cyan-400 bg-cyan-900/60 px-2 py-0.5 rounded border border-cyan-700/50 hidden sm:inline">
-            Full duplex audio
-          </span>
         </div>
       )}
 
+      {/* Incident strip: keeps "why is there no audio?" visible while the user
+          scrolls the transcript (desktop panels alone are easy to miss). */}
+      {activeTab === 'prototype-1' && (
+        <StatusStrip
+          status={status}
+          message={errorMessage || noticeMessage}
+          attempt={reconnectAttempt}
+          onStopSession={handleStopSession}
+          onRetry={() => void handleStartSession()}
+        />
+      )}
+
       {/* Main Content Area */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+      <main id="main-content" tabIndex={-1} className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
         {healthState === 'ready' && health && !health.deepgramApiKeyConfigured && (
           <ApiKeyWarningBanner onRefreshHealth={checkHealth} />
         )}
@@ -869,6 +910,7 @@ export default function App() {
                 onInjectText={handleInjectText}
                 isConnected={status === 'READY'}
                 speculative={speculative}
+                listenModel={modelConfig.listenModel}
               />
 
               <DiagnosticsPanel events={events} onClearEvents={() => setEvents([])} />

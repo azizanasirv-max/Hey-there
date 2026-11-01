@@ -32,31 +32,32 @@ export const MicrophonePanel: React.FC<MicrophonePanelProps> = ({
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl space-y-4">
       {/* Header */}
-      <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+      <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-800">
         <div className="flex items-center gap-2">
-          <Mic className={`w-4 h-4 ${isStreaming && !isMuted ? 'text-cyan-400' : 'text-slate-400'}`} />
-          <h2 className="text-sm font-bold text-slate-100">Microphone & Speaker Audio</h2>
+          <Mic className={`w-4 h-4 ${isStreaming && !isMuted ? 'text-cyan-400' : 'text-slate-400'}`} aria-hidden="true" />
+          <h2 className="text-sm font-bold text-slate-100">Microphone &amp; Speaker Audio</h2>
         </div>
 
         {/* Permission Badge */}
         <div>
           {permissionStatus === 'granted' ? (
             <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-400 bg-emerald-500/10 px-2.5 py-0.5 rounded-full border border-emerald-500/20">
-              <Check className="w-3 h-3" />
+              <Check className="w-3 h-3" aria-hidden="true" />
               Mic Permission Granted
             </span>
           ) : permissionStatus === 'denied' ? (
             <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-rose-400 bg-rose-500/10 px-2.5 py-0.5 rounded-full border border-rose-500/20">
-              <ShieldAlert className="w-3 h-3" />
+              <ShieldAlert className="w-3 h-3" aria-hidden="true" />
               Mic Permission Denied
             </span>
           ) : permissionStatus === 'unsupported' ? (
             <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-400 bg-amber-500/10 px-2.5 py-0.5 rounded-full border border-amber-500/20">
-              <AlertTriangle className="w-3 h-3" />
+              <AlertTriangle className="w-3 h-3" aria-hidden="true" />
               Mic Unavailable
             </span>
           ) : (
             <button
+              type="button"
               onClick={onRequestPermission}
               className="text-[11px] font-semibold text-cyan-400 hover:text-cyan-300 bg-cyan-500/10 px-2.5 py-0.5 rounded-full border border-cyan-500/30 hover:bg-cyan-500/20 transition-colors cursor-pointer"
             >
@@ -81,7 +82,7 @@ export const MicrophonePanel: React.FC<MicrophonePanelProps> = ({
             {isStreaming && !isMuted ? <Mic className="w-5 h-5 animate-pulse" /> : <MicOff className="w-5 h-5" />}
           </div>
 
-          <div>
+          <div aria-live="polite">
             <div className="text-sm font-bold text-slate-200">
               {isStreaming
                 ? captureDegraded
@@ -102,24 +103,33 @@ export const MicrophonePanel: React.FC<MicrophonePanelProps> = ({
         <div className="flex items-center gap-2">
           {isStreaming && (
             <button
+              type="button"
               onClick={onToggleMute}
+              aria-pressed={isMuted}
+              aria-label={isMuted ? 'Unmute microphone' : 'Mute microphone (keeps the session alive with silence frames)'}
               className={`flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-xs font-bold transition-all cursor-pointer ${
                 isMuted
                   ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30'
                   : 'bg-slate-800 text-slate-200 hover:bg-slate-700 border border-slate-700'
               }`}
             >
-              {isMuted ? <Mic className="w-4 h-4 text-amber-400" /> : <MicOff className="w-4 h-4 text-slate-400" />}
+              {isMuted ? (
+                <Mic className="w-4 h-4 text-amber-400" aria-hidden="true" />
+              ) : (
+                <MicOff className="w-4 h-4 text-slate-400" aria-hidden="true" />
+              )}
               <span>{isMuted ? 'Unmute Mic' : 'Mute Mic'}</span>
             </button>
           )}
           {captureDegraded && (
             <button
+              type="button"
               onClick={onRetryAudio}
+              aria-label="Restart audio capture"
               title="Restart the audio capture graph"
               className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-bold bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 hover:bg-cyan-500/30 transition-colors cursor-pointer"
             >
-              <RefreshCw className="w-4 h-4" />
+              <RefreshCw className="w-4 h-4" aria-hidden="true" />
               <span>Restart Audio</span>
             </button>
           )}
@@ -136,7 +146,15 @@ export const MicrophonePanel: React.FC<MicrophonePanelProps> = ({
           <span className="font-mono font-bold text-slate-300">{volumeLevel}%</span>
         </div>
 
-        <div className="w-full bg-slate-950 h-3 rounded-full overflow-hidden p-0.5 border border-slate-800">
+        <div
+          role="progressbar"
+          aria-label="Live microphone input level"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={volumeLevel}
+          aria-valuetext={`${volumeLevel}% of full scale`}
+          className="w-full bg-slate-950 h-3 rounded-full overflow-hidden p-0.5 border border-slate-800"
+        >
           <div
             className={`h-full rounded-full transition-all duration-75 ${
               volumeLevel > 85

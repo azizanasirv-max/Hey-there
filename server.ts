@@ -1,6 +1,7 @@
 import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
+import { existsSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
@@ -13,7 +14,8 @@ import {
   normalizeAgentConfig,
 } from './src/shared/voiceAgentConfig';
 
-dotenv.config();
+// `quiet` keeps dotenv's v17 banner out of structured production logs.
+dotenv.config({ quiet: true });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -35,6 +37,11 @@ const CLIENT_PING_INTERVAL_MS = 20000;
 /** Back-pressure guard: drop microphone frames rather than buffer unboundedly. */
 const MAX_UPSTREAM_BUFFERED_BYTES = 1_000_000;
 const MAX_CLIENT_BUFFERED_BYTES = 2_000_000;
+/** Where the production client build lives (written by `npm run build`). */
+const CLIENT_DIST_DIR = path.join(__dirname, 'dist');
+const CLIENT_INDEX_FILE = path.join(CLIENT_DIST_DIR, 'index.html');
+/** Path the browser dials for the Voice Agent session (see src/utils/voiceAgentSession.ts). */
+const WS_PATH = '/api/agent-proxy';
 
 type Labelled = { at: number; label: string };
 
@@ -51,10 +58,28 @@ async function startServer() {
   const app = express();
   const server = createServer(app);
   const isProd = process.env.NODE_ENV === 'production';
-  const PORT = process.env.PORT || 3000;
+  const parsedPort = Number(process.env.PORT);
+  const PORT = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : 3000;
+  /** Render/Cloud Run/Docker route traffic to 0.0.0.0, never to localhost only. */
+  const HOST = process.env.HOST?.trim() || '0.0.0.0';
   const agentUrl = process.env.DEEPGRAM_AGENT_URL?.trim() || DEFAULT_AGENT_WS_URL;
 
-  app.use(express.json());
+  // Render terminates TLS at its edge and forwards `X-Forwarded-Proto/Host`.
+  // Trusting one proxy hop makes `req.protocol` / `req.ip` / `req.hostname`
+  // truthful (and keeps `wss://` upgrades diagnosable) without trusting a
+  // client-supplied header.
+  app.set('trust proxy', 1);
+  app.disable('x-powered-by');
+
+  app.use(express.json({ limit: '256kb' }));
+
+  // Minimal hardening headers (no extra dependency): the app is HTML + assets,
+  // never user-uploaded content, so sniffing/framing protection is enough.
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    next();
+  });
 
   // Health endpoint for backend & API key status verification
   app.get('/api/health', (req, res) => {
@@ -74,21 +99,41 @@ async function startServer() {
       timestamp: new Date().toISOString(),
       uptime: process.uptime(),
       environment: process.env.NODE_ENV || 'development',
+      // Deployment self-description: lets an operator prove from `curl` which
+      // mode (Vite dev middleware vs built assets) and endpoint the service uses.
+      serving: isProd ? 'static-dist' : 'vite-dev-middleware',
+      webSocketPath: WS_PATH,
+      nodeVersion: process.version,
+      commit: process.env.RENDER_GIT_COMMIT?.slice(0, 7) || process.env.GIT_COMMIT?.slice(0, 7) || null,
     });
   });
 
   const wss = new WebSocketServer({ noServer: true });
 
   server.on('upgrade', (request, socket, head) => {
-    const host = request.headers.host || 'localhost';
-    const url = new URL(request.url || '', `http://${host}`);
-    if (url.pathname === '/api/agent-proxy') {
+    // Parse the path on a synthetic origin: the Host header may arrive from a
+    // load balancer and must never be able to change which route matches.
+    let pathname = '';
+    try {
+      pathname = new URL(request.url || '/', 'http://localhost').pathname;
+    } catch {
+      pathname = '';
+    }
+    if (pathname === WS_PATH) {
       wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit('connection', ws, request);
       });
-    } else {
-      socket.destroy();
+      return;
     }
+    // Answer instead of silently destroying the socket: a wrong path must be
+    // visible in the browser/network tab, not an opaque connection reset.
+    console.warn(`[Proxy] Rejected WebSocket upgrade for unknown path: ${request.url}`);
+    try {
+      socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+    } catch {
+      /* ignore */
+    }
+    socket.destroy();
   });
 
   wss.on('connection', (clientWs: WebSocket) => {
@@ -548,17 +593,93 @@ async function startServer() {
       appType: 'spa',
     });
     app.use(vite.middlewares);
+    console.log('[Server] Dev mode: serving sources through Vite middleware (no build required).');
   } else {
-    app.use(express.static(path.join(__dirname, 'dist')));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+    // Production: serve the built client. Hashed assets are immutable, while
+    // index.html must never be cached or a deploy cannot reach an open tab.
+    if (!existsSync(CLIENT_INDEX_FILE)) {
+      console.error(
+        `[Server] FATAL: production mode but ${CLIENT_INDEX_FILE} is missing. ` +
+          'Run `npm run build` (vite build) before starting, or set NODE_ENV=development.'
+      );
+      process.exit(1);
+    }
+    app.use(
+      express.static(CLIENT_DIST_DIR, {
+        index: false,
+        etag: true,
+        lastModified: true,
+        maxAge: '1h',
+        setHeaders: (res, filePath) => {
+          if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+            // Vite emits content-hashed filenames -> safe to cache forever.
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          } else if (filePath.endsWith('.html')) {
+            res.setHeader('Cache-Control', 'no-store, must-revalidate');
+          }
+        },
+      })
+    );
+    // SPA fallback: /prototype-1, /architecture and any deep link.
+    app.get('*', (req, res, next) => {
+      if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+      // A missing *asset* is a deploy problem, not a route: never answer it
+      // with index.html (that turns a 404 into a bogus 200 text/html and makes
+      // a half-uploaded build look healthy).
+      if (req.path.startsWith('/assets/')) {
+        res.status(404).type('text/plain').send('Asset not found');
+        return;
+      }
+      res.set('Cache-Control', 'no-store, must-revalidate');
+      res.sendFile(CLIENT_INDEX_FILE, (err) => {
+        if (err) next(err);
+      });
     });
+    console.log(`[Server] Production mode: serving built client from ${CLIENT_DIST_DIR}`);
   }
 
+  // Last-resort error handler: never leak a stack trace to a browser, and keep
+  // API errors JSON so the client's status contract can diagnose them.
+  app.use((err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    console.error('[Server] Unhandled request error:', err);
+    if (res.headersSent) return;
+    if (req.path.startsWith('/api/')) {
+      res.status(500).json({ error: 'INTERNAL_ERROR', message: 'Internal server error.' });
+      return;
+    }
+    res.status(500).type('text/plain').send('Internal server error');
+  });
+
+  // Render sends SIGTERM when it replaces an instance. Drain cleanly so no
+  // browser is left holding a half-open (paid) upstream Voice Agent socket.
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[Server] ${signal} received — closing clients and HTTP server.`);
+    for (const client of wss.clients) {
+      try {
+        client.close(1001, 'server shutting down');
+      } catch {
+        /* ignore */
+      }
+    }
+    wss.close();
+    server.close(() => {
+      console.log('[Server] Shutdown complete.');
+      process.exit(0);
+    });
+    // Never hang a deploy: force-exit if sockets refuse to drain.
+    setTimeout(() => process.exit(0), 8000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+
   return new Promise<void>((resolve) => {
-    server.listen(Number(PORT), '0.0.0.0', () => {
-      console.log(`[Server] Deepgram Voice Agent Proxy running on http://0.0.0.0:${PORT}`);
+    server.listen(PORT, HOST, () => {
+      console.log(`[Server] Deepgram Voice Agent Proxy running on http://${HOST}:${PORT}`);
       console.log(`[Server] Upstream agent endpoint: ${agentUrl}`);
+      console.log(`[Server] WebSocket path: ${WS_PATH} (ws:// for http, wss:// behind TLS)`);
       resolve();
     });
   });

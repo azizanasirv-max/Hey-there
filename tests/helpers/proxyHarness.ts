@@ -147,26 +147,27 @@ export interface TestClient {
 /** Spawn the real proxy server against the mock upstream. */
 export async function startProxy(
   env: Record<string, string>,
-  serverFile = 'server.ts'
+  serverFile = 'server.ts',
+  options: { useNode?: boolean } = {}
 ): Promise<ProxyProcess> {
   const port = await getFreePort();
   let logs = '';
-  const child: ChildProcess = spawn(
-    process.execPath,
-    ['--import', 'tsx', path.isAbsolute(serverFile) ? serverFile : path.join(ROOT, serverFile)],
-    {
-      cwd: ROOT,
-      env: {
-        ...process.env,
-        NODE_ENV: 'production',
-        PORT: String(port),
-        DEEPGRAM_API_KEY: 'test-key-not-real',
-        PROXY_IDLE_KEEPALIVE_MS: '800',
-        ...env,
-      },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    }
-  );
+  const entry = path.isAbsolute(serverFile) ? serverFile : path.join(ROOT, serverFile);
+  // `useNode` runs the esbuild bundle exactly like Render's `npm start`
+  // (plain node, no TypeScript loader) instead of loading server.ts through tsx.
+  const args = options.useNode ? [entry] : ['--import', 'tsx', entry];
+  const child: ChildProcess = spawn(process.execPath, args, {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      NODE_ENV: 'production',
+      PORT: String(port),
+      DEEPGRAM_API_KEY: 'test-key-not-real',
+      PROXY_IDLE_KEEPALIVE_MS: '800',
+      ...env,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
   child.stdout?.on('data', (d) => (logs += d.toString()));
   child.stderr?.on('data', (d) => (logs += d.toString()));
 
