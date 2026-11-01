@@ -1,8 +1,17 @@
 node_modules/
 build/
 dist/
+dist-server/
 coverage/
 .DS_Store
 *.log
 .env*
 !.env.example
+# Bundled server produced by `npm run build` (esbuild output)
+server.js
+# Local TLS materials used by the production-mode verification test
+tests/.certs/
+.bench
+
+# Local screenshot output (docs/screenshots is tracked)
+artifacts/

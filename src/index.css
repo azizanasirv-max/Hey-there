@@ -9,6 +9,52 @@
   code, pre, .font-mono {
     font-family: 'JetBrains Mono', monospace;
   }
+
+  /* Keyboard navigation must always be visible on a dark UI. */
+  :focus-visible {
+    outline: 2px solid var(--color-cyan-400);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  /* Long unbroken payloads (JSON in the event log) must wrap, not overflow
+     the viewport on a phone. */
+  pre, code {
+    overflow-wrap: anywhere;
+  }
+}
+
+/* Skip link: first tab stop, hidden until focused. */
+.skip-link {
+  position: fixed;
+  top: 0.5rem;
+  left: 0.5rem;
+  z-index: 100;
+  transform: translateY(-200%);
+  transition: transform 150ms ease-in;
+  background: var(--color-cyan-500);
+  color: var(--color-slate-950);
+  font-weight: 700;
+  font-size: 0.75rem;
+  padding: 0.5rem 0.875rem;
+  border-radius: 0.5rem;
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+}
+
+/* Respect the OS "reduce motion" preference: pulsing/looping indicators calm
+   down, but nothing becomes invisible or unreadable. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 /* Custom subtle scrollbar for diagnostic event logs */

@@ -1,5 +1,5 @@
 import React from 'react';
-import { ArrowRight, CheckCircle2, ShieldCheck, Zap, Radio, VolumeX, Cpu, Server, Code2 } from 'lucide-react';
+import { CheckCircle2, Zap, Volume2, Cpu, Code2 } from 'lucide-react';
 
 export const ArchitectureView: React.FC = () => {
   return (
@@ -41,7 +41,9 @@ export const ArchitectureView: React.FC = () => {
             { step: '4', title: 'Send "Settings"', desc: 'Proxy sends exactly one valid official Settings JSON payload matching the documented schema (type: "Settings", audio, agent.listen, agent.think, agent.speak).' },
             { step: '5', title: 'Wait for "SettingsApplied"', desc: 'Proxy awaits Deepgram {"type": "SettingsApplied"} message confirming settings acceptance.' },
             { step: '6', title: 'Notify Browser SessionReady', desc: 'Proxy notifies browser with {"type": "SessionReady"}. Microphone streaming is unlocked.' },
-            { step: '7', title: 'Continuous Binary PCM Audio Streaming', desc: 'Browser resamples microphone input to 24kHz 16-bit linear PCM and streams binary frames continuously.' },
+            { step: '7', title: 'Continuous Binary PCM Audio Streaming', desc: 'Browser resamples microphone input to 24kHz 16-bit linear PCM (AudioWorklet, 20 ms frames) and streams binary frames continuously — including silence frames while muted.' },
+            { step: '8', title: 'Agent Voice Playback', desc: 'Binary linear16 frames from the agent are forwarded to the browser and scheduled back-to-back on a 24 kHz AudioContext for gapless playback; UserStartedSpeaking flushes the queue (barge-in).' },
+            { step: '9', title: 'Keep-alive & Auto-Reconnect', desc: 'The proxy relays {"type":"KeepAlive"} after 8 s of uplink silence and the client reconnects with exponential backoff (0.5→8 s, 5 attempts), re-sending Settings so audio resumes without a page reload.' },
           ].map((item) => (
             <div key={item.step} className="p-3.5 bg-slate-950 rounded-lg border border-slate-800 flex items-start gap-3">
               <div className="w-6 h-6 rounded-full bg-cyan-500/20 text-cyan-400 border border-cyan-500/40 flex items-center justify-center font-bold text-xs shrink-0">
@@ -85,27 +87,32 @@ export const ArchitectureView: React.FC = () => {
           </ul>
         </div>
 
-        {/* Audio Discard Technical Requirement */}
+        {/* Agent voice playback path */}
         <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl space-y-3">
           <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2">
-            <VolumeX className="w-4 h-4 text-indigo-400" />
-            Binary TTS Discard Rule
+            <Volume2 className="w-4 h-4 text-indigo-400" />
+            Full-duplex audio contract
           </h3>
           <p className="text-xs text-slate-300 leading-relaxed">
-            Per prototype design requirements, generated binary audio frames from Deepgram are discarded server-side immediately upon arrival.
+            The agent's binary linear16 (24 kHz, mono, container-less) frames are relayed to the browser and played
+            through a scheduled Web Audio queue. No HTML media element is used and no container header is required.
           </p>
           <ul className="space-y-1.5 text-xs text-slate-400">
             <li className="flex items-center gap-2">
               <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Zero binary audio data forwarded to browser.</span>
+              <span>Agent audio forwarded as binary frames (not discarded).</span>
             </li>
             <li className="flex items-center gap-2">
               <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-              <span>No audio playback or HTML Audio elements.</span>
+              <span>Gapless scheduling with a 60 ms lead; barge-in flushes the queue.</span>
             </li>
             <li className="flex items-center gap-2">
               <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Text-only display of customer speech and AI responses.</span>
+              <span>Microphone keeps streaming silence while muted so the session never times out.</span>
+            </li>
+            <li className="flex items-center gap-2">
+              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Transcripts, latency reports and audio stats are streamed as they arrive.</span>
             </li>
           </ul>
         </div>

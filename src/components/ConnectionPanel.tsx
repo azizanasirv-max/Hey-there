@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Play, Square, Settings, Cpu, Mic, Volume2, ShieldCheck, Zap, ChevronDown, ChevronUp } from 'lucide-react';
-import { ConnectionStatus, ModelConfig, BackendHealthResponse } from '../types/deepgram';
+import { ConnectionStatus, ModelConfig, BackendHealthResponse, BackendHealthState } from '../types/deepgram';
+import { DEFAULT_TURN_DETECTION, isFluxListenModel } from '../shared/voiceAgentConfig';
 
 interface ConnectionPanelProps {
   status: ConnectionStatus;
@@ -10,6 +11,11 @@ interface ConnectionPanelProps {
   onStartSession: () => void;
   onStopSession: () => void;
   errorMessage: string | null;
+  noticeMessage?: string | null;
+  healthState?: BackendHealthState;
+  healthHttpStatus?: number | null;
+  healthMessage?: string | null;
+  onRefreshHealth?: () => void;
 }
 
 export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
@@ -20,6 +26,11 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
   onStartSession,
   onStopSession,
   errorMessage,
+  noticeMessage,
+  healthState = 'unknown',
+  healthHttpStatus = null,
+  healthMessage = null,
+  onRefreshHealth,
 }) => {
   const [showConfigOptions, setShowConfigOptions] = useState(false);
 
@@ -30,6 +41,13 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
             <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
             Session Ready (Streaming Active)
+          </span>
+        );
+      case 'RECONNECTING':
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/30">
+            <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+            Reconnecting (audio kept open)
           </span>
         );
       case 'CONNECTING':
@@ -65,7 +83,30 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
     }
   };
 
-  const isConnected = status === 'READY' || status === 'CONNECTING' || status === 'WAITING_FOR_WELCOME' || status === 'SETTINGS_SENT';
+  const canStart = healthState === 'ready' && Boolean(health?.deepgramApiKeyConfigured);
+  const isConnected =
+    status === 'READY' ||
+    status === 'CONNECTING' ||
+    status === 'WAITING_FOR_WELCOME' ||
+    status === 'SETTINGS_SENT' ||
+    status === 'RECONNECTING';
+
+  /**
+   * Why the Start button is disabled. A disabled button with only a `title`
+   * tooltip is a dead end on touch devices, so the reason is always rendered
+   * next to it (and wired to the button with `aria-describedby`).
+   */
+  const startBlockedReason = canStart
+    ? null
+    : healthState === 'starting'
+    ? `Waiting for the backend to finish starting (HTTP ${healthHttpStatus ?? 202} accepted). This retries automatically.`
+    : healthState === 'unknown'
+    ? 'Checking backend health…'
+    : healthState === 'ready'
+    ? 'DEEPGRAM_API_KEY is not configured on the server. Add it to the environment and restart/redeploy.'
+    : `Backend not ready${healthHttpStatus ? ` (HTTP ${healthHttpStatus})` : ''}${
+        healthMessage ? ` — ${healthMessage}` : ''
+      }`;
 
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl space-y-5">
@@ -89,14 +130,16 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
         {!isConnected ? (
           <button
             onClick={onStartSession}
-            disabled={!health?.deepgramApiKeyConfigured}
+            disabled={!canStart}
+            aria-describedby={startBlockedReason ? 'start-blocked-reason' : undefined}
+            title={canStart ? 'Start a Voice Agent session' : startBlockedReason || 'Backend is not ready'}
             className={`flex-1 flex items-center justify-center gap-2 py-3 px-5 rounded-lg font-bold text-sm transition-all shadow-lg ${
-              health?.deepgramApiKeyConfigured
+              canStart
                 ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-slate-950 hover:from-cyan-400 hover:to-blue-500 shadow-cyan-500/20 active:scale-[0.99] cursor-pointer'
                 : 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700'
             }`}
           >
-            <Play className="w-4 h-4 fill-current" />
+            <Play className="w-4 h-4 fill-current" aria-hidden="true" />
             Start Voice Agent Session
           </button>
         ) : (
@@ -104,25 +147,83 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
             onClick={onStopSession}
             className="flex-1 flex items-center justify-center gap-2 py-3 px-5 rounded-lg font-bold text-sm bg-rose-600/90 hover:bg-rose-500 text-white transition-all shadow-lg shadow-rose-600/20 active:scale-[0.99] cursor-pointer"
           >
-            <Square className="w-4 h-4 fill-current" />
-            Stop Session & Clean Up
+            <Square className="w-4 h-4 fill-current" aria-hidden="true" />
+            Stop Session &amp; Clean Up
           </button>
         )}
 
         <button
           onClick={() => setShowConfigOptions(!showConfigOptions)}
           disabled={isConnected}
-          className="flex items-center justify-center gap-2 py-3 px-4 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors disabled:opacity-50"
+          aria-expanded={showConfigOptions && !isConnected}
+          aria-controls="model-config-panel"
+          title={
+            isConnected
+              ? 'Model settings are locked while a session is live — stop the session to change them.'
+              : 'Show or hide the Deepgram model configuration'
+          }
+          className="flex items-center justify-center gap-2 py-3 px-4 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
         >
-          <Settings className="w-4 h-4" />
+          <Settings className="w-4 h-4" aria-hidden="true" />
           <span>Config Models</span>
-          {showConfigOptions ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+          {showConfigOptions ? <ChevronUp className="w-3.5 h-3.5" aria-hidden="true" /> : <ChevronDown className="w-3.5 h-3.5" aria-hidden="true" />}
         </button>
       </div>
 
+      {startBlockedReason && !isConnected && (
+        <p id="start-blocked-reason" className="text-[11px] text-amber-300/90 bg-amber-950/30 border border-amber-900/60 rounded-lg px-3 py-2 leading-relaxed">
+          <span className="font-bold text-amber-200">Start is disabled:</span> {startBlockedReason}
+        </p>
+      )}
+
+      {healthState !== 'ready' && (
+        <div
+          className={`p-3 rounded-lg text-xs font-mono border ${
+            healthState === 'starting'
+              ? 'bg-cyan-950/40 border-cyan-800/70 text-cyan-200'
+              : healthState === 'unknown'
+              ? 'bg-slate-950/60 border-slate-800 text-slate-300'
+              : 'bg-rose-950/40 border-rose-800/70 text-rose-200'
+          }`}
+        >
+          <div className="flex items-start justify-between gap-3">
+            <span>
+              <span className="font-bold">
+                {healthState === 'starting'
+                  ? `Backend accepted the request asynchronously (HTTP ${healthHttpStatus ?? 202})`
+                  : healthState === 'unknown'
+                  ? 'Checking backend…'
+                  : `Backend not ready${healthHttpStatus ? ` (HTTP ${healthHttpStatus})` : ''}`}
+              </span>
+              {healthMessage ? ` — ${healthMessage}` : ''}
+            </span>
+            {onRefreshHealth && (
+              <button
+                type="button"
+                onClick={onRefreshHealth}
+                aria-label="Re-check backend health now"
+                className="shrink-0 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold cursor-pointer"
+              >
+                Retry now
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {errorMessage && (
-        <div className="p-3 bg-rose-950/50 border border-rose-800/80 rounded-lg text-xs text-rose-300 font-mono">
+        <div role="alert" className="p-3 bg-rose-950/50 border border-rose-800/80 rounded-lg text-xs text-rose-300 font-mono">
           <span className="font-bold text-rose-200">Error:</span> {errorMessage}
+        </div>
+      )}
+
+      {noticeMessage && !errorMessage && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="p-3 bg-amber-950/40 border border-amber-800/70 rounded-lg text-xs text-amber-200 font-mono"
+        >
+          <span className="font-bold text-amber-100">Notice:</span> {noticeMessage}
         </div>
       )}
 
@@ -170,7 +271,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
 
       {/* Collapsible Config Options */}
       {showConfigOptions && !isConnected && (
-        <div className="p-4 bg-slate-950/80 rounded-lg border border-slate-800 space-y-3">
+        <div id="model-config-panel" className="p-4 bg-slate-950/80 rounded-lg border border-slate-800 space-y-3">
           <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider">
             Deepgram Settings Configuration
           </h3>
@@ -179,12 +280,24 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
               <label className="block text-slate-400 mb-1">Listening Model (STT)</label>
               <select
                 value={modelConfig.listenModel}
-                onChange={(e) => setModelConfig({ ...modelConfig, listenModel: e.target.value })}
+                onChange={(e) => {
+                  const listenModel = e.target.value;
+                  // Flux (v2) is the only family with end-of-turn tuning, so it is
+                  // enabled by default there and dropped for nova (v1).
+                  setModelConfig({
+                    ...modelConfig,
+                    listenModel,
+                    turnDetection: isFluxListenModel(listenModel)
+                      ? modelConfig.turnDetection || { ...DEFAULT_TURN_DETECTION }
+                      : undefined,
+                  });
+                }}
                 className="w-full bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-slate-200 font-mono focus:border-cyan-500 outline-none"
               >
                 <option value="nova-3">nova-3 (Recommended Default)</option>
                 <option value="nova-2">nova-2</option>
                 <option value="nova-2-general">nova-2-general</option>
+                <option value="flux-general-en">flux-general-en (Flux v2 — lowest turn latency)</option>
               </select>
             </div>
 
@@ -195,11 +308,16 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
                 onChange={(e) => setModelConfig({ ...modelConfig, thinkModel: e.target.value })}
                 className="w-full bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-slate-200 font-mono focus:border-cyan-500 outline-none"
               >
-                <option value="gpt-4o-mini">gpt-4o-mini (Recommended Default)</option>
+                <option value="gpt-4o-mini">gpt-4o-mini (Recommended Default — lowest latency)</option>
+                <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+                <option value="gpt-4.1-nano">gpt-4.1-nano</option>
                 <option value="gpt-4o">gpt-4o</option>
-                <option value="claude-3-5-sonnet">claude-3-5-sonnet</option>
-                <option value="llama-3.3-70b-instruct">llama-3.3-70b-instruct</option>
+                <option value="gpt-5-mini">gpt-5-mini</option>
               </select>
+              <p className="text-[10px] text-slate-500 mt-1">
+                Only models the <span className="font-mono">open_ai</span> provider accepts are listed; anything
+                else is rejected by Deepgram with INVALID_SETTINGS.
+              </p>
             </div>
 
             <div>
@@ -216,6 +334,33 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
               </select>
             </div>
           </div>
+
+          {isFluxListenModel(modelConfig.listenModel) ? (
+            <label className="flex items-start gap-2 p-2.5 bg-slate-900/70 rounded border border-slate-800 text-[11px] text-slate-300 cursor-pointer">
+              <input
+                type="checkbox"
+                className="mt-0.5 accent-cyan-500"
+                checked={Boolean(modelConfig.turnDetection)}
+                onChange={(e) =>
+                  setModelConfig({
+                    ...modelConfig,
+                    turnDetection: e.target.checked ? { ...DEFAULT_TURN_DETECTION } : undefined,
+                  })
+                }
+              />
+              <span>
+                <span className="font-semibold text-slate-200">Low-latency turn detection</span> — eager end-of-turn{' '}
+                {DEFAULT_TURN_DETECTION.eagerEotThreshold} / eot {DEFAULT_TURN_DETECTION.eotThreshold} /{' '}
+                {DEFAULT_TURN_DETECTION.eotTimeoutMs} ms cap, so the agent starts thinking before the user's turn is
+                fully confirmed (speculative replies).
+              </span>
+            </label>
+          ) : (
+            <p className="text-[11px] text-slate-500 leading-relaxed">
+              End-of-turn tuning (<code className="text-slate-400">eot_*</code>) is only accepted by Flux (v2) listen
+              models. Select <span className="font-mono text-slate-400">flux-general-en</span> to enable it.
+            </p>
+          )}
         </div>
       )}
 

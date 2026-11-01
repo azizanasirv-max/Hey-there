@@ -5,11 +5,23 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build",
-    "start": "tsx server.ts",
-    "preview": "vite preview",
+    "build": "vite build && npm run build:server",
+    "build:client": "vite build",
+    "build:server": "esbuild server.ts --bundle --platform=node --target=node20 --format=esm --packages=external --legal-comments=none --outfile=server.js",
+    "start": "node server.js",
+    "start:dev": "tsx server.ts",
+    "preview": "npm run build && npm run start",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "test:unit": "node --import tsx --test tests/pcm.test.ts tests/settings.test.ts tests/playbackScheduler.test.ts tests/conversation.test.ts tests/http.test.ts tests/session.test.ts",
+    "test:prod": "npm run build && node --import tsx --test tests/production.test.ts",
+    "bench": "node --import tsx scripts/bench-pipeline.ts",
+    "test:e2e": "node --import tsx tests/e2e/audio.e2e.ts",
+    "test:e2e:prod": "npm run build && node --import tsx tests/e2e/production.e2e.ts",
+    "test:all": "npm run lint && npm run test && npm run test:prod && npm run test:e2e && npm run test:e2e:prod",
+    "test:live": "node --import tsx scripts/live-latency.ts",
+    "verify:live": "node --import tsx scripts/verify-deployment.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -31,7 +43,8 @@
     "@types/react-dom": "^19.3.0",
     "@types/ws": "^8.18.2",
     "autoprefixer": "^10.4.21",
-    "esbuild": "^0.25.0",
+    "esbuild": "^0.28.0",
+    "puppeteer-core": "^25.16.0",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2"

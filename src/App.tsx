@@ -7,7 +7,12 @@ import { DiagnosticsPanel } from './components/DiagnosticsPanel';
 import { TelemetryPanel } from './components/TelemetryPanel';
 import { ApiKeyWarningBanner } from './components/ApiKeyWarningBanner';
 import { ArchitectureView } from './components/ArchitectureView';
-import { AudioStreamer } from './utils/audioStreamer';
+import { StatusStrip } from './components/StatusStrip';
+import { AudioStreamer, AudioStreamerState, MicFailureReason } from './utils/audioStreamer';
+import { PcmAudioPlayer, PlayerStats } from './utils/audioPlayer';
+import { VoiceAgentSession } from './utils/voiceAgentSession';
+import { ConversationTracker } from './utils/conversation';
+import { probeBackendHealth, probeAgentUpgrade } from './utils/http';
 import {
   ConnectionStatus,
   ModelConfig,
@@ -15,8 +20,51 @@ import {
   ConversationMessage,
   DeepgramEvent,
   SessionTelemetry,
+  LatencyMetrics,
+  MicStatus,
+  BackendHealthState,
+  EMPTY_LATENCY,
 } from './types/deepgram';
-import { MonitorCheck, ExternalLink } from 'lucide-react';
+import { DEFAULT_AGENT_CONFIG } from './shared/voiceAgentConfig';
+import { ExternalLink } from 'lucide-react';
+
+
+/** How long the UI waits for a 202/204-accepted backend before surfacing an error. */
+const MAX_HEALTH_STARTUP_WAIT_MS = 60_000;
+
+const EMPTY_TELEMETRY: SessionTelemetry = {
+  startTime: null,
+  durationSeconds: 0,
+  receivedTextEvents: 0,
+  sentAudioChunks: 0,
+  sentAudioBytes: 0,
+  droppedAudioFrames: 0,
+  agentAudioFrames: 0,
+  agentAudioBytes: 0,
+  connectionFailures: 0,
+  reconnects: 0,
+  latency: EMPTY_LATENCY,
+};
+
+const EMPTY_MIC_STATUS: MicStatus = {
+  streaming: false,
+  contextState: null,
+  trackState: null,
+  captureSampleRate: null,
+  backend: null,
+  droppedFrames: 0,
+};
+
+const EMPTY_PLAYER_STATUS: PlayerStats = {
+  playing: false,
+  contextState: null,
+  framesQueued: 0,
+  framesPlayed: 0,
+  framesDropped: 0,
+  underruns: 0,
+  lastFirstAudibleDelayMs: null,
+  bufferedMs: 0,
+};
 
 export default function App() {
   // Client-side URL route management for /prototype-1
@@ -41,44 +89,39 @@ export default function App() {
   useEffect(() => {
     setIsIframe(window.self !== window.top);
 
-    // Ensure URL shows /prototype-1 if on root /
     if (window.location.pathname === '/' || window.location.pathname === '') {
       window.history.replaceState(null, '', '/prototype-1');
     }
 
-    const handlePopState = () => {
-      setActiveTabState(getRouteFromLocation());
-    };
-
+    const handlePopState = () => setActiveTabState(getRouteFromLocation());
     window.addEventListener('popstate', handlePopState);
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
   // Backend Health
   const [health, setHealth] = useState<BackendHealthResponse | null>(null);
+  const [healthState, setHealthState] = useState<BackendHealthState>('unknown');
+  const [healthMessage, setHealthMessage] = useState<string | null>(null);
+  const [healthHttpStatus, setHealthHttpStatus] = useState<number | null>(null);
+  const [healthTick, setHealthTick] = useState(0);
+  const healthWaitStartRef = useRef<number | null>(null);
+  const healthPollAttemptsRef = useRef(0);
 
   // Connection State
   const [status, setStatus] = useState<ConnectionStatus>('DISCONNECTED');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [noticeMessage, setNoticeMessage] = useState<string | null>(null);
+  const [reconnectAttempt, setReconnectAttempt] = useState<number | null>(null);
 
-  // Initial Model Configuration
-  const [modelConfig, setModelConfig] = useState<ModelConfig>({
-    listenProvider: 'deepgram',
-    listenModel: 'nova-3',
-    thinkProvider: 'open_ai',
-    thinkModel: 'gpt-4o-mini',
-    speakProvider: 'deepgram',
-    speakModel: 'flux-kit-en',
-    speakVersion: 'v2',
-    sampleRate: 24000,
-    encoding: 'linear16',
-  });
+  // Model Configuration (single source of truth, shared with the proxy)
+  const [modelConfig, setModelConfig] = useState<ModelConfig>({ ...DEFAULT_AGENT_CONFIG });
 
   // Audio & Microphone State
   const [permissionStatus, setPermissionStatus] = useState<'granted' | 'denied' | 'prompt' | 'unsupported'>('prompt');
-  const [isStreaming, setIsStreaming] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [volumeLevel, setVolumeLevel] = useState(0);
+  const [micStatus, setMicStatus] = useState(EMPTY_MIC_STATUS);
+  const [playerStatus, setPlayerStatus] = useState<PlayerStats>(EMPTY_PLAYER_STATUS);
 
   // Live Conversation & Diagnostics
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
@@ -87,66 +130,149 @@ export default function App() {
   const [agentThinking, setAgentThinking] = useState(false);
 
   // Telemetry Metrics
-  const [telemetry, setTelemetry] = useState<SessionTelemetry>({
-    startTime: null,
-    durationSeconds: 0,
-    receivedTextEvents: 0,
-    discardedAudioFrames: 0,
-    discardedAudioBytes: 0,
-    connectionFailures: 0,
-    sentAudioChunks: 0,
-  });
+  const [telemetry, setTelemetry] = useState<SessionTelemetry>(EMPTY_TELEMETRY);
 
   // Refs
-  const wsRef = useRef<WebSocket | null>(null);
-  const audioStreamerRef = useRef<AudioStreamer>(new AudioStreamer());
-  const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const sessionRef = useRef<VoiceAgentSession | null>(null);
+  const streamerRef = useRef<AudioStreamer>(new AudioStreamer());
+  const playerRef = useRef<PcmAudioPlayer>(new PcmAudioPlayer());
+  const timerIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const levelRafRef = useRef<number | null>(null);
+  const volumeRef = useRef(0);
+  const lastVolumeCommitRef = useRef(0);
+  const statsDirtyRef = useRef(false);
+  const pendingStatsRef = useRef({
+    sentAudioChunks: 0,
+    sentAudioBytes: 0,
+    droppedAudioFrames: 0,
+    agentAudioFrames: 0,
+    agentAudioBytes: 0,
+    receivedTextEvents: 0,
+  });
+  /** Conversation/turn state machine (pure, unit tested — src/utils/conversation.ts). */
+  const trackerRef = useRef(new ConversationTracker());
+  const [speculative, setSpeculative] = useState(false);
+  const micRecoveryRef = useRef<{ lastAttemptAt: number; attempts: number }>({ lastAttemptAt: 0, attempts: 0 });
+  const playerStatsRef = useRef<PlayerStats>(EMPTY_PLAYER_STATUS);
+  const sessionStartedRef = useRef(false);
 
-  // 1. Fetch Backend Health
-  const checkHealth = useCallback(async () => {
-    try {
-      const res = await fetch('/api/health');
-      if (res.ok) {
-        const data: BackendHealthResponse = await res.json();
-        setHealth(data);
-      } else {
-        setHealth(null);
+  // 1. Backend health — explicit HTTP status contract (see src/utils/http.ts).
+  //    HTTP 202/204 means "accepted, still starting": poll with backoff instead
+  //    of reporting the backend as offline (and never treat a 2xx as ready).
+  const probeHealth = useCallback(async () => {
+    const result = await probeBackendHealth('/api/health');
+    healthPollAttemptsRef.current += 1;
+    setHealthHttpStatus(result.httpStatus);
+    setHealthMessage(result.message);
+    setHealthState(result.state);
+
+    if (result.health) setHealth(result.health);
+    else if (result.state !== 'starting') setHealth(null);
+
+    if (result.state === 'starting') {
+      if (healthWaitStartRef.current === null) healthWaitStartRef.current = Date.now();
+      const waitedMs = Date.now() - healthWaitStartRef.current;
+      if (waitedMs >= MAX_HEALTH_STARTUP_WAIT_MS) {
+        setHealthState('error');
+        setHealthMessage(
+          `Backend still answering HTTP ${result.httpStatus ?? 'n/a'} after ${Math.round(
+            MAX_HEALTH_STARTUP_WAIT_MS / 1000
+          )}s (${healthPollAttemptsRef.current} probes). ` +
+            'The edge/proxy is accepting the request asynchronously instead of serving it — check that HTTPS ' +
+            'traffic to /api/health reaches this server.'
+        );
       }
-    } catch (e) {
-      console.error('Health check failed:', e);
-      setHealth(null);
+    } else {
+      healthWaitStartRef.current = null;
+      healthPollAttemptsRef.current = 0;
     }
+
+    // Re-arm the poll for the next tick (bounded by MAX_HEALTH_STARTUP_WAIT_MS).
+    setHealthTick((n) => n + 1);
+    return result;
   }, []);
 
+  const checkHealth = useCallback(async () => {
+    healthWaitStartRef.current = null;
+    healthPollAttemptsRef.current = 0;
+    await probeHealth();
+  }, [probeHealth]);
+
   useEffect(() => {
-    checkHealth();
-  }, [checkHealth]);
+    void probeHealth();
+  }, [probeHealth]);
+
+  // Retry loop while the backend reports "starting" (202/204).
+  useEffect(() => {
+    if (healthState !== 'starting') return;
+    const delay = Math.min(3000, 500 * Math.pow(1.6, Math.min(6, healthPollAttemptsRef.current)));
+    const timer = setTimeout(() => void probeHealth(), delay);
+    return () => clearTimeout(timer);
+  }, [healthState, healthTick, probeHealth]);
 
   // Session Duration Timer
   useEffect(() => {
     if (status === 'READY') {
-      if (!telemetry.startTime) {
-        setTelemetry((prev) => ({ ...prev, startTime: Date.now() }));
-      }
+      if (!telemetry.startTime) setTelemetry((prev) => ({ ...prev, startTime: Date.now() }));
       timerIntervalRef.current = setInterval(() => {
         setTelemetry((prev) => ({
           ...prev,
-          durationSeconds: prev.startTime ? Math.floor((Date.now() - prev.startTime) / 1000) : prev.durationSeconds + 1,
+          durationSeconds: prev.startTime
+            ? Math.floor((Date.now() - prev.startTime) / 1000)
+            : prev.durationSeconds + 1,
         }));
       }, 1000);
-    } else {
-      if (timerIntervalRef.current) {
-        clearInterval(timerIntervalRef.current);
-        timerIntervalRef.current = null;
-      }
+    } else if (timerIntervalRef.current) {
+      clearInterval(timerIntervalRef.current);
+      timerIntervalRef.current = null;
     }
     return () => {
       if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
     };
   }, [status, telemetry.startTime]);
 
+  /**
+   * Telemetry is batched: audio callbacks only mutate refs; React state is
+   * committed at most once per second. This is what removes ~100 renders/s.
+   */
+  const flushStats = useCallback(() => {
+    if (!statsDirtyRef.current) return;
+    statsDirtyRef.current = false;
+    const pending = pendingStatsRef.current;
+    setTelemetry((prev) => ({
+      ...prev,
+      sentAudioChunks: pending.sentAudioChunks,
+      sentAudioBytes: pending.sentAudioBytes,
+      droppedAudioFrames: pending.droppedAudioFrames,
+      agentAudioFrames: pending.agentAudioFrames,
+      agentAudioBytes: pending.agentAudioBytes,
+      receivedTextEvents: pending.receivedTextEvents,
+      latency: {
+        ...prev.latency,
+        firstAudioBufferingMs: playerRef.current.getStats().lastFirstAudibleDelayMs,
+        settingsToFirstAudioMs: prev.latency.settingsToFirstAudioMs,
+      },
+    }));
+  }, []);
+
+  // Playback stats arrive per frame (~50/s) — buffer them in a ref and publish
+  // them once per second so audio never drives React render cadence.
+  useEffect(() => {
+    playerRef.current.onStats = (stats: PlayerStats) => {
+      playerStatsRef.current = stats;
+    };
+  }, []);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      flushStats();
+      setPlayerStatus({ ...playerStatsRef.current });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [flushStats]);
+
   // Add Event to Diagnostics
-  const logEvent = (type: string, category: DeepgramEvent['category'], rawJson: any) => {
+  const logEvent = useCallback((type: string, category: DeepgramEvent['category'], rawJson: any) => {
     const newEvent: DeepgramEvent = {
       id: `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
       timestamp: new Date().toLocaleTimeString(),
@@ -155,281 +281,599 @@ export default function App() {
       rawJson,
     };
     setEvents((prev) => [newEvent, ...prev.slice(0, 199)]);
-  };
+  }, []);
 
-  // Request Mic Permission
-  const handleRequestMicPermission = async () => {
+  // ------------------------------------------------------------ audio plumbing
+  const streamerHandlers = useCallback(
+    () => ({
+      onLevel: (level: number) => {
+        volumeRef.current = level;
+      },
+      onFrameSent: (bytes: number) => {
+        pendingStatsRef.current.sentAudioChunks += 1;
+        pendingStatsRef.current.sentAudioBytes += bytes;
+        statsDirtyRef.current = true;
+      },
+      onFrameDropped: () => {
+        pendingStatsRef.current.droppedAudioFrames += 1;
+        statsDirtyRef.current = true;
+      },
+      onStateChange: (state: AudioStreamerState) => {
+        setMicStatus({
+          streaming: state.streaming,
+          contextState: state.contextState,
+          trackState: state.trackState,
+          captureSampleRate: state.captureSampleRate,
+          backend: state.backend,
+          droppedFrames: state.droppedFrames,
+        });
+      },
+      onFailure: (reason: MicFailureReason, message: string) => {
+        void handleMicFailure(reason, message);
+      },
+      onDeviceLost: () => {
+        setUserSpeaking(false);
+      },
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
+
+  /** Start (or re-point) the microphone stream into the live session. */
+  const ensureAudioRunning = useCallback(async () => {
     try {
-      await audioStreamerRef.current.requestMicrophone();
-      setPermissionStatus('granted');
+      await streamerRef.current.startStreaming(
+        (frame) => sessionRef.current?.sendAudio(frame) ?? false,
+        streamerHandlers()
+      );
+      setErrorMessage((prev) => (prev && prev.toLowerCase().includes('audio') ? null : prev));
     } catch (err: any) {
-      console.error('Mic permission error:', err);
-      setPermissionStatus('denied');
-      setErrorMessage(err.message || 'Microphone access denied');
+      const message = err?.message || 'Audio streaming failed';
+      setErrorMessage(message);
+      if (err?.micReason === 'permission-denied') setPermissionStatus('denied');
     }
-  };
+  }, [streamerHandlers]);
 
-  // 2. Start Session
+  /** Bounded microphone recovery: never loops, never leaves audio silently dead. */
+  const handleMicFailure = useCallback(
+    async (reason: MicFailureReason, message: string) => {
+      if (reason === 'permission-denied') {
+        setPermissionStatus('denied');
+        setErrorMessage(message);
+        return;
+      }
+      if (reason === 'unsupported' || reason === 'insecure-context') {
+        setPermissionStatus('unsupported');
+        setErrorMessage(message);
+        return;
+      }
+
+      setErrorMessage(message);
+      const now = Date.now();
+      const rec = micRecoveryRef.current;
+      if (now - rec.lastAttemptAt < 4000 || rec.attempts >= 3) {
+        setNoticeMessage('Microphone recovery gave up. Reconnect the device, then restart the session.');
+        return;
+      }
+      micRecoveryRef.current = { lastAttemptAt: now, attempts: rec.attempts + 1 };
+      setNoticeMessage(`Audio interrupted (${reason}). Re-acquiring microphone (attempt ${rec.attempts + 1}/3)…`);
+
+      try {
+        await streamerRef.current.ensureMicrophone();
+        setPermissionStatus('granted');
+        await ensureAudioRunning();
+        setErrorMessage(null);
+        setNoticeMessage('Microphone recovered.');
+        micRecoveryRef.current.attempts = 0;
+      } catch (err: any) {
+        setErrorMessage(err?.message || 'Microphone could not be recovered.');
+      }
+    },
+    [ensureAudioRunning]
+  );
+
+  // Live VU meter throttled to ~15 fps (was: a state commit per audio chunk).
+  useEffect(() => {
+    if (!micStatus.streaming) {
+      setVolumeLevel(0);
+      return;
+    }
+    let cancelled = false;
+    const tick = () => {
+      if (cancelled) return;
+      const now = performance.now();
+      if (now - lastVolumeCommitRef.current >= 66) {
+        lastVolumeCommitRef.current = now;
+        setVolumeLevel(volumeRef.current);
+      }
+      levelRafRef.current = requestAnimationFrame(tick);
+    };
+    levelRafRef.current = requestAnimationFrame(tick);
+    return () => {
+      cancelled = true;
+      if (levelRafRef.current !== null) cancelAnimationFrame(levelRafRef.current);
+      levelRafRef.current = null;
+    };
+  }, [micStatus.streaming]);
+
+  // ------------------------------------------------------- session event pump
+  const handleSessionEvent = useCallback(
+    (type: string, data: any, receivedAt: number) => {
+      const category: DeepgramEvent['category'] =
+        type === 'Error'
+          ? 'error'
+          : type === 'Warning'
+          ? 'error'
+          : type === 'Welcome' || type === 'SettingsApplied' || type === 'ProxyStatus' || type === 'SessionReady'
+          ? 'settings'
+          : type === 'AgentAudioStats' || type === 'LatencyReport'
+          ? 'audio'
+          : type === 'ConversationText' && data?.role === 'user'
+          ? 'user'
+          : 'agent';
+
+      // Audio-stat frames are already aggregated server-side (1/s); do not log them.
+      if (type !== 'AgentAudioStats') logEvent(type, category, data);
+
+      switch (type) {
+        case 'UserStartedSpeaking': {
+          // Barge-in: the user talks over the agent -> stop playback instantly.
+          playerRef.current.flush();
+          trackerRef.current.noteUserStartedSpeaking(receivedAt);
+          setUserSpeaking(true);
+          setAgentThinking(false);
+          setSpeculative(false);
+          break;
+        }
+        case 'AgentStartedSpeaking': {
+          playerRef.current.beginTurn();
+          setAgentThinking(false);
+          setSpeculative(false);
+          break;
+        }
+        case 'AgentThinking': {
+          trackerRef.current.noteAgentThinking(receivedAt);
+          setAgentThinking(true);
+          setUserSpeaking(false);
+          break;
+        }
+        case 'AgentAudioDone': {
+          trackerRef.current.noteAgentAudioDone(receivedAt);
+          setAgentThinking(false);
+          playerRef.current.beginTurn();
+          break;
+        }
+        /**
+         * Flux turn lifecycle. In the Voice Agent integration the agent performs
+         * eager (speculative) processing server-side when
+         * `eager_eot_threshold` is configured; these events are handled here for
+         * protocol completeness and to reflect/cancel speculative UI state
+         * without ever producing a duplicate reply.
+         */
+        case 'EagerEndOfTurn': {
+          trackerRef.current.noteEagerEndOfTurn(receivedAt, data?.transcript);
+          setSpeculative(true);
+          setAgentThinking(true);
+          setUserSpeaking(false);
+          break;
+        }
+        case 'TurnResumed': {
+          // The user kept talking: cancel the speculative turn (no reply is
+          // shown, because assistant text is only emitted once confirmed).
+          trackerRef.current.noteTurnResumed(receivedAt);
+          setSpeculative(false);
+          setAgentThinking(false);
+          setUserSpeaking(true);
+          break;
+        }
+        case 'EndOfTurn': {
+          trackerRef.current.noteEndOfTurn(receivedAt);
+          setSpeculative(false);
+          break;
+        }
+        case 'TurnInfo': {
+          // Defensive: Flux STT-style payloads use `event` inside `TurnInfo`.
+          const evt = data?.event;
+          if (evt === 'EagerEndOfTurn') {
+            trackerRef.current.noteEagerEndOfTurn(receivedAt, data?.transcript);
+            setSpeculative(true);
+            setAgentThinking(true);
+          } else if (evt === 'TurnResumed') {
+            trackerRef.current.noteTurnResumed(receivedAt);
+            setSpeculative(false);
+            setAgentThinking(false);
+          } else if (evt === 'EndOfTurn') {
+            trackerRef.current.noteEndOfTurn(receivedAt);
+            setSpeculative(false);
+          }
+          break;
+        }
+        /**
+         * ConversationText — rendered IMMEDIATELY on arrival. Nothing here waits
+         * for audio frames, `AgentAudioDone`, or playback; the transcript and the
+         * speaker run independently.
+         */
+        case 'ConversationText': {
+          const result = trackerRef.current.noteConversationText(data, receivedAt);
+          if (result.accepted && result.message) {
+            setMessages((prev) => [...prev, result.message!]);
+            pendingStatsRef.current.receivedTextEvents += 1;
+            statsDirtyRef.current = true;
+            if (result.message.role === 'user') setUserSpeaking(false);
+            if (result.isFirstAssistantText) {
+              const lat = trackerRef.current.latency();
+              setTelemetry((prev) => ({
+                ...prev,
+                latency: {
+                  ...prev.latency,
+                  speechStartToFirstTextMs: lat.speechStartToFirstTextMs,
+                  eotToFirstTextMs: lat.eotToFirstTextMs,
+                  speculativeWindowMs: lat.speculativeWindowMs,
+                  speculativeGainMs: lat.speculativeGainMs,
+                  turnResumes: trackerRef.current.current.turnResumedCount,
+                },
+              }));
+            }
+          } else if (result.reason === 'duplicate') {
+            console.debug('[Conversation] duplicate ConversationText ignored:', data?.content);
+          }
+          break;
+        }
+        case 'LatencyReport': {
+          const toMs = (v: unknown) => {
+            const n = typeof v === 'number' ? v : parseFloat(String(v));
+            return Number.isFinite(n) ? Math.round(n * 1000) : null;
+          };
+          setTelemetry((prev) => ({
+            ...prev,
+            latency: {
+              ...prev.latency,
+              sttMs: toMs(data?.stt_latency),
+              thinkMs: toMs(data?.ttt_text_latency ?? data?.ttt_token_latency),
+              ttsMs: toMs(data?.tts_latency),
+              totalMs: toMs(data?.total_latency),
+            },
+          }));
+          break;
+        }
+        case 'AgentAudioStats': {
+          pendingStatsRef.current.agentAudioFrames = data?.frames ?? 0;
+          pendingStatsRef.current.agentAudioBytes = data?.bytes ?? 0;
+          pendingStatsRef.current.droppedAudioFrames =
+            (data?.inputDroppedFrames ?? 0) + (data?.droppedFrames ?? 0);
+          statsDirtyRef.current = true;
+          if (typeof data?.firstAudioDelayMs === 'number') {
+            setTelemetry((prev) => ({
+              ...prev,
+              latency: { ...prev.latency, settingsToFirstAudioMs: data.firstAudioDelayMs },
+            }));
+          }
+          break;
+        }
+        case 'ProxyStatus': {
+          if (data?.status === 'SettingsSent') setStatus('SETTINGS_SENT');
+          if (data?.status === 'Disconnected') {
+            setUserSpeaking(false);
+            setAgentThinking(false);
+            playerRef.current.flush();
+          }
+          break;
+        }
+        case 'Warning': {
+          setNoticeMessage(`${data?.code ? `[${data.code}] ` : ''}${data?.description || data?.message || ''}`);
+          break;
+        }
+        default:
+          break;
+      }
+    },
+    [logEvent]
+  );
+
+  const handleAgentAudio = useCallback((frame: ArrayBuffer, receivedAt: number) => {
+    trackerRef.current.noteAudioFrame(receivedAt);
+    pendingStatsRef.current.agentAudioFrames += 1;
+    pendingStatsRef.current.agentAudioBytes += frame.byteLength;
+    statsDirtyRef.current = true;
+
+    // Playback is independent of the transcript: enqueue immediately.
+    playerRef.current.enqueue(frame);
+
+    const turn = trackerRef.current.current;
+    if (turn.firstAudioAt === receivedAt) {
+      const lat = trackerRef.current.latency();
+      setTelemetry((prev) => ({
+        ...prev,
+        latency: {
+          ...prev.latency,
+          speechStartToFirstAudioMs: lat.speechStartToFirstAudioMs,
+          eotToFirstAudioMs: lat.eotToFirstAudioMs,
+          firstTextToFirstAudioMs: lat.firstTextToFirstAudioMs,
+        },
+      }));
+    }
+  }, []);
+
+  // ------------------------------------------------------------------ session
   const handleStartSession = async () => {
+    // Guard: rapid double clicks must not open two sockets or two mic streams.
+    if (sessionStartedRef.current) return;
+    sessionStartedRef.current = true;
+
     setErrorMessage(null);
+    setNoticeMessage(null);
     setStatus('CONNECTING');
 
-    // Step A: Ensure Microphone Permission directly from browser window
+    // Step A: microphone permission straight from the browser window.
     try {
-      await audioStreamerRef.current.requestMicrophone();
+      await streamerRef.current.ensureMicrophone();
       setPermissionStatus('granted');
     } catch (err: any) {
+      sessionStartedRef.current = false;
       setStatus('ERROR');
-      setPermissionStatus('denied');
-      setErrorMessage(`Microphone access required: ${err.message}`);
+      setPermissionStatus(err?.micReason === 'permission-denied' ? 'denied' : 'prompt');
+      setErrorMessage(`Microphone access required: ${err?.message || err}`);
       setTelemetry((prev) => ({ ...prev, connectionFailures: prev.connectionFailures + 1 }));
       return;
     }
 
-    // Reset telemetry for new clean session
-    setTelemetry({
-      startTime: Date.now(),
-      durationSeconds: 0,
-      receivedTextEvents: 0,
-      discardedAudioFrames: 0,
-      discardedAudioBytes: 0,
-      connectionFailures: telemetry.connectionFailures,
-      sentAudioChunks: 0,
-    });
-
-    // Step B: Open WebSocket Proxy Connection
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/api/agent-proxy`;
-
-    logEvent('ClientConnecting', 'connection', { wsUrl, timestamp: new Date().toISOString() });
-
+    // Step B: unlock playback inside the user gesture (autoplay policy).
     try {
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
+      await playerRef.current.ensure();
+    } catch (err) {
+      console.warn('[App] playback AudioContext unavailable', err);
+    }
 
-      ws.onopen = () => {
-        setStatus('WAITING_FOR_WELCOME');
-        logEvent('WebSocketProxyConnected', 'connection', { url: wsUrl });
+    // Reset per-session counters (cumulative failure counts are kept).
+    pendingStatsRef.current = {
+      sentAudioChunks: 0,
+      sentAudioBytes: 0,
+      droppedAudioFrames: 0,
+      agentAudioFrames: 0,
+      agentAudioBytes: 0,
+      receivedTextEvents: 0,
+    };
+    statsDirtyRef.current = false;
+    trackerRef.current.beginSession();
+    setSpeculative(false);
+    micRecoveryRef.current = { lastAttemptAt: 0, attempts: 0 };
+    playerRef.current.resetCounters();
+    setTelemetry((prev) => ({
+      ...EMPTY_TELEMETRY,
+      startTime: Date.now(),
+      connectionFailures: prev.connectionFailures,
+    }));
 
-        // Send model settings configuration to proxy backend (proxy translates to official Deepgram Settings schema)
-        const customSettingsPayload = {
-          type: 'ConfigureSettings',
-          config: {
-            listenProvider: modelConfig.listenProvider,
-            listenModel: modelConfig.listenModel,
-            thinkProvider: modelConfig.thinkProvider,
-            thinkModel: modelConfig.thinkModel,
-            speakProvider: modelConfig.speakProvider,
-            speakModel: modelConfig.speakModel,
-            speakVersion: modelConfig.speakVersion || 'v2',
-            sampleRate: modelConfig.sampleRate,
-            encoding: modelConfig.encoding,
-          },
-        };
-        ws.send(JSON.stringify(customSettingsPayload));
-      };
-
-      ws.onmessage = async (event) => {
-        if (typeof event.data !== 'string') return;
-
-        try {
-          const data = JSON.parse(event.data);
-
-          const category: DeepgramEvent['category'] =
-            data.type === 'Error'
-              ? 'error'
-              : data.type === 'Welcome' || data.type === 'SettingsApplied' || data.type === 'ProxyStatus'
-              ? 'settings'
-              : data.type === 'AudioDiscardedTelemetry'
-              ? 'audio'
-              : 'agent';
-
-          logEvent(data.type || 'Message', category, data);
-
-          if (data.type === 'ProxyStatus') {
-            if (data.status === 'SettingsSent') {
-              setStatus('SETTINGS_SENT');
-            } else if (data.status === 'Disconnected') {
-              setStatus('DISCONNECTED');
-              setIsStreaming(false);
-              audioStreamerRef.current.stopStreaming();
-            }
-          } else if (data.type === 'SessionReady' || data.type === 'SettingsApplied') {
-            setStatus('READY');
-            setIsStreaming(true);
-
-            try {
-              await audioStreamerRef.current.startStreaming(
-                ws,
-                (volume) => setVolumeLevel(volume),
-                () => setTelemetry((prev) => ({ ...prev, sentAudioChunks: prev.sentAudioChunks + 1 }))
-              );
-            } catch (streamErr: any) {
-              setErrorMessage(`Audio streaming failed: ${streamErr.message}`);
-            }
-          } else if (data.type === 'UserStartedSpeaking') {
-            setUserSpeaking(true);
-            setAgentThinking(false);
-          } else if (data.type === 'AgentThinking') {
-            setAgentThinking(true);
-            setUserSpeaking(false);
-          } else if (data.type === 'AgentAudioDone') {
-            setAgentThinking(false);
-          } else if (data.type === 'ConversationText') {
-            setUserSpeaking(false);
-            setAgentThinking(false);
-
-            const role = data.role === 'user' ? 'user' : 'assistant';
-            const content = data.content || data.text || '';
-
-            if (content.trim().length > 0) {
-              setMessages((prev) => [
-                ...prev,
-                {
-                  id: `${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-                  role,
-                  content,
-                  timestamp: new Date().toLocaleTimeString(),
-                  isFinal: data.is_final ?? true,
-                },
-              ]);
-              setTelemetry((prev) => ({ ...prev, receivedTextEvents: prev.receivedTextEvents + 1 }));
-            }
-          } else if (data.type === 'AudioDiscardedTelemetry') {
-            setTelemetry((prev) => ({
-              ...prev,
-              discardedAudioFrames: data.frames,
-              discardedAudioBytes: data.bytes,
-            }));
-          } else if (data.type === 'Error') {
-            const errDescription = data.description || data.message || 'Deepgram API error';
-            const errCode = data.code ? `[${data.code}] ` : '';
-            setErrorMessage(`${errCode}${errDescription}`);
-            setStatus('ERROR');
-            // Terminate audio streaming and timer immediately on fatal protocol error to protect usage
-            setIsStreaming(false);
-            setVolumeLevel(0);
-            audioStreamerRef.current.stopStreaming();
-            if (timerIntervalRef.current) {
-              clearInterval(timerIntervalRef.current);
-              timerIntervalRef.current = null;
+    const session = new VoiceAgentSession({
+      config: modelConfig,
+      handlers: {
+        onStatus: (next, info) => {
+          setStatus(next as ConnectionStatus);
+          if (next === 'RECONNECTING') {
+            setReconnectAttempt(info?.attempt ?? null);
+            const why = info?.reason && info.reason !== 'connection lost' ? ` (${info.reason})` : '';
+            setNoticeMessage(
+              `The socket dropped${why}. Retrying in ${Math.round(info?.nextRetryMs ?? 0)} ms` +
+                ` — attempt ${info?.attempt ?? 1}.` +
+                ' The microphone stays open; audio resumes automatically.'
+            );
+          } else if (next === 'READY' || next === 'DISCONNECTED' || next === 'ERROR') {
+            setReconnectAttempt(null);
+          }
+        },
+        onEvent: handleSessionEvent,
+        onAudio: handleAgentAudio,
+        onReady: ({ reconnected, attempt }) => {
+          setNoticeMessage(reconnected ? `Session restored (attempt ${attempt}). Audio pipeline is live.` : null);
+          setErrorMessage(null);
+          if (reconnected) setTelemetry((prev) => ({ ...prev, reconnects: prev.reconnects + 1 }));
+          void ensureAudioRunning();
+        },
+        onFatal: (error) => {
+          setErrorMessage(error.message);
+          setStatus('ERROR');
+          setUserSpeaking(false);
+          setAgentThinking(false);
+          setSpeculative(false);
+          playerRef.current.flush();
+        },
+        onWarning: (code, message) => {
+          setNoticeMessage(`${code ? `[${code}] ` : ''}${message}`);
+        },
+        onClose: ({ code, reason, willReconnect }) => {
+          setUserSpeaking(false);
+          setAgentThinking(false);
+          setSpeculative(false);
+          playerRef.current.flush();
+          trackerRef.current.endSession();
+          if (!willReconnect) {
+            streamerRef.current.stopStreaming(true);
+            sessionStartedRef.current = false;
+            if (code !== 1000) {
+              const base = `Session ended (code ${code}${reason ? `: ${reason}` : ''}).`;
+              setNoticeMessage(`${base} Press Start to open a new session.`);
+              // Diagnose the transport: a non-101 answer from an edge/proxy looks
+              // exactly like a failed WebSocket in the browser (code 1006, no
+              // detail). Probe over HTTP to name the real cause.
+              if (code === 1006 || code === 4000) {
+                void probeAgentUpgrade(
+                  `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/api/agent-proxy`
+                ).then((probe) => {
+                  setErrorMessage(`${base} ${probe.message}`);
+                  logEvent('TransportDiagnosis', 'connection', probe);
+                });
+              }
             }
           }
-        } catch (jsonErr) {
-          console.error('Failed to parse WebSocket message:', jsonErr);
-        }
-      };
+        },
+      },
+    });
 
-      ws.onerror = (err) => {
-        console.error('WebSocket Error:', err);
-        setStatus('ERROR');
-        setErrorMessage('Proxy WebSocket connection error.');
-        setTelemetry((prev) => ({ ...prev, connectionFailures: prev.connectionFailures + 1 }));
-      };
-
-      ws.onclose = (e) => {
-        console.log(`WebSocket closed: code=${e.code}, reason=${e.reason}`);
-        setStatus((current) => (current === 'ERROR' ? 'ERROR' : 'DISCONNECTED'));
-        setIsStreaming(false);
-        setVolumeLevel(0);
-        audioStreamerRef.current.stopStreaming();
-        if (timerIntervalRef.current) {
-          clearInterval(timerIntervalRef.current);
-          timerIntervalRef.current = null;
-        }
-      };
-    } catch (err: any) {
-      setStatus('ERROR');
-      setErrorMessage(`Failed to open WebSocket: ${err.message}`);
-      setTelemetry((prev) => ({ ...prev, connectionFailures: prev.connectionFailures + 1 }));
-    }
+    sessionRef.current = session;
+    session.connect();
   };
 
   // 3. Stop Session
   const handleStopSession = () => {
-    if (wsRef.current) {
-      wsRef.current.close(1000, 'User stopped session');
-      wsRef.current = null;
-    }
-    audioStreamerRef.current.stopStreaming();
-    setIsStreaming(false);
+    sessionStartedRef.current = false;
+    sessionRef.current?.stop();
+    sessionRef.current = null;
+    streamerRef.current.stopStreaming(true);
+    void playerRef.current.close();
     setStatus('DISCONNECTED');
     setVolumeLevel(0);
     setUserSpeaking(false);
     setAgentThinking(false);
+    setMicStatus(EMPTY_MIC_STATUS);
+    setPlayerStatus(EMPTY_PLAYER_STATUS);
     if (timerIntervalRef.current) {
       clearInterval(timerIntervalRef.current);
       timerIntervalRef.current = null;
     }
   };
 
-  // Mute / Unmute
+  // Keep the session's config in sync with the UI (applied on next connect).
+  useEffect(() => {
+    sessionRef.current?.updateConfig(modelConfig);
+  }, [modelConfig]);
+
+  /** Manual "Restart Audio" button: bypasses the automatic recovery throttle. */
+  const handleManualAudioRestart = async () => {
+    micRecoveryRef.current = { lastAttemptAt: 0, attempts: 0 };
+    setNoticeMessage('Restarting audio capture…');
+    try {
+      await streamerRef.current.stopStreaming(true);
+      await streamerRef.current.ensureMicrophone();
+      setPermissionStatus('granted');
+      await ensureAudioRunning();
+      setErrorMessage(null);
+      setNoticeMessage('Audio capture restarted.');
+    } catch (err: any) {
+      setErrorMessage(err?.message || 'Audio restart failed.');
+    }
+  };
+
+  // Mute / Unmute (silence frames keep the session alive — see AudioStreamer)
   const handleToggleMute = () => {
     const nextMuted = !isMuted;
     setIsMuted(nextMuted);
-    audioStreamerRef.current.setMute(nextMuted);
+    streamerRef.current.setMute(nextMuted);
+  };
+
+  // Request Mic Permission (idempotent — never opens a second stream)
+  const handleRequestMicPermission = async () => {
+    try {
+      await streamerRef.current.ensureMicrophone();
+      setPermissionStatus('granted');
+      setErrorMessage(null);
+      if (sessionStartedRef.current) await ensureAudioRunning();
+    } catch (err: any) {
+      console.error('Mic permission error:', err);
+      setPermissionStatus(err?.micReason === 'permission-denied' ? 'denied' : 'prompt');
+      setErrorMessage(err?.message || 'Microphone access denied');
+    }
   };
 
   // Inject manual text prompt
   const handleInjectText = (text: string) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      const payload = {
-        type: 'InjectUserMessage',
-        content: text,
-      };
-      wsRef.current.send(JSON.stringify(payload));
-
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `${Date.now()}-user-injected`,
-          role: 'user',
-          content: text,
-          timestamp: new Date().toLocaleTimeString(),
-        },
-      ]);
-      setTelemetry((prev) => ({ ...prev, receivedTextEvents: prev.receivedTextEvents + 1 }));
+    const sent = sessionRef.current?.injectUserMessage(text) ?? false;
+    if (!sent) {
+      setNoticeMessage('Text injection ignored: the session is not ready yet.');
+      return;
     }
+    setMessages((prev) => [
+      ...prev,
+      { id: `${Date.now()}-user-injected`, role: 'user', content: text, timestamp: new Date().toLocaleTimeString() },
+    ]);
+    pendingStatsRef.current.receivedTextEvents += 1;
+    statsDirtyRef.current = true;
   };
+
+  // Cleanup on unmount: never leave a socket or a microphone track behind.
+  useEffect(() => {
+    return () => {
+      sessionRef.current?.stop();
+      streamerRef.current.dispose();
+      void playerRef.current.close();
+      if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
+    };
+  }, []);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
-      
-      {/* Top Header */}
+      {/* First tab stop: jump past the header straight to the working area. */}
+      <a href="#main-content" className="skip-link">
+        Skip to main content
+      </a>
+
       <Header
         health={health}
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         onRefreshHealth={checkHealth}
+        healthState={healthState}
+        healthHttpStatus={healthHttpStatus}
+        healthMessage={healthMessage}
       />
 
-      {/* Standalone Window Banner Notification */}
-      {!isIframe && (
-        <div className="bg-cyan-950/60 border-b border-cyan-800/80 px-4 py-2 text-xs text-cyan-200 flex items-center justify-between max-w-7xl mx-auto w-full">
-          <div className="flex items-center gap-2">
-            <MonitorCheck className="w-4 h-4 text-cyan-400 shrink-0" />
+      {/* Screen-reader live region: connection state changes are announced even
+          though the visual badges are spread across several panels. */}
+      <span className="sr-only" role="status" aria-live="polite">
+        {status === 'READY'
+          ? 'Voice agent session ready. Microphone streaming.'
+          : status === 'RECONNECTING'
+          ? `Connection lost. Reconnecting${reconnectAttempt ? `, attempt ${reconnectAttempt}` : ''}.`
+          : status === 'ERROR'
+          ? `Session error. ${errorMessage || ''}`
+          : status === 'DISCONNECTED'
+          ? 'Voice agent session stopped.'
+          : status === 'CONNECTING' || status === 'WAITING_FOR_WELCOME' || status === 'SETTINGS_SENT'
+          ? 'Connecting to the voice agent.'
+          : ''}
+      </span>
+
+      {/* Embedded-preview warning: inside an iframe the browser can block the
+          microphone, so this banner only appears when it can actually bite. */}
+      {isIframe && (
+        <div className="bg-amber-950/70 border-b border-amber-800/80 px-4 py-2 text-xs text-amber-100">
+          <div className="flex flex-wrap items-center gap-2 max-w-7xl mx-auto w-full">
             <span>
-              <strong>Standalone Browser Page Active</strong> — Running directly at <code className="text-cyan-300 font-mono">{typeof window !== 'undefined' ? window.location.pathname : '/prototype-1'}</code> outside embedded preview iframe. Direct microphone streaming enabled.
+              <strong>Embedded preview detected.</strong> Browsers often block microphone access inside an iframe —
+              open the app in its own tab to start a real session.
             </span>
+            <a
+              href={typeof window !== 'undefined' ? `${window.location.origin}/prototype-1` : '/prototype-1'}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 font-bold text-amber-100"
+            >
+              <ExternalLink className="w-3.5 h-3.5" aria-hidden="true" />
+              Open standalone
+            </a>
           </div>
-          <span className="text-[10px] font-mono text-cyan-400 bg-cyan-900/60 px-2 py-0.5 rounded border border-cyan-700/50 hidden sm:inline">
-            Direct Routing Ready
-          </span>
         </div>
       )}
 
+      {/* Incident strip: keeps "why is there no audio?" visible while the user
+          scrolls the transcript (desktop panels alone are easy to miss). */}
+      {activeTab === 'prototype-1' && (
+        <StatusStrip
+          status={status}
+          message={errorMessage}
+          attempt={reconnectAttempt}
+          onStopSession={handleStopSession}
+          onRetry={() => void handleStartSession()}
+        />
+      )}
+
       {/* Main Content Area */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
-        
-        {/* Missing API Key Banner */}
-        {health && !health.deepgramApiKeyConfigured && (
+      <main id="main-content" tabIndex={-1} className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+        {healthState === 'ready' && health && !health.deepgramApiKeyConfigured && (
           <ApiKeyWarningBanner onRefreshHealth={checkHealth} />
         )}
 
         {activeTab === 'prototype-1' ? (
           <div className="space-y-6">
-            
-            {/* Top Grid: Connection & Microphone Controls */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
               <ConnectionPanel
                 status={status}
@@ -439,19 +883,26 @@ export default function App() {
                 onStartSession={handleStartSession}
                 onStopSession={handleStopSession}
                 errorMessage={errorMessage}
+                noticeMessage={noticeMessage}
+                healthState={healthState}
+                healthHttpStatus={healthHttpStatus}
+                healthMessage={healthMessage}
+                onRefreshHealth={() => void checkHealth()}
               />
 
               <MicrophonePanel
                 permissionStatus={permissionStatus}
-                isStreaming={isStreaming}
+                isStreaming={micStatus.streaming}
                 isMuted={isMuted}
                 volumeLevel={volumeLevel}
+                micStatus={micStatus}
+                playerStatus={playerStatus}
                 onToggleMute={handleToggleMute}
                 onRequestPermission={handleRequestMicPermission}
+                onRetryAudio={() => void handleManualAudioRestart()}
               />
             </div>
 
-            {/* Middle Grid: Real-Time Conversation vs Event Diagnostics */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
               <ConversationPanel
                 messages={messages}
@@ -460,38 +911,31 @@ export default function App() {
                 onClearMessages={() => setMessages([])}
                 onInjectText={handleInjectText}
                 isConnected={status === 'READY'}
+                speculative={speculative}
+                listenModel={modelConfig.listenModel}
               />
 
-              <DiagnosticsPanel
-                events={events}
-                onClearEvents={() => setEvents([])}
-              />
+              <DiagnosticsPanel events={events} onClearEvents={() => setEvents([])} />
             </div>
 
-            {/* Bottom Grid: Telemetry Stats */}
-            <TelemetryPanel telemetry={telemetry} />
-
+            <TelemetryPanel telemetry={telemetry} playerStatus={playerStatus} />
           </div>
         ) : (
           <ArchitectureView />
         )}
-
       </main>
 
       {/* Footer */}
       <footer className="border-t border-slate-900 bg-slate-950 py-4 text-center text-xs text-slate-500">
         <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
-          <div>
-            Deepgram Voice Agent API Prototype 1 · Node.js Express WebSocket Proxy
-          </div>
-          <div className="font-mono text-[11px] text-slate-600 flex items-center gap-3">
+          <div>Deepgram Voice Agent API Prototype 1 · Node.js Express WebSocket Proxy</div>
+          <div className="font-mono text-[11px] text-slate-600 flex flex-wrap items-center justify-center gap-x-2 gap-y-1 max-w-full">
             <span>Route: /prototype-1</span>
-            <span>·</span>
-            <span>wss://agent.deepgram.com/v1/agent/converse</span>
+            <span aria-hidden="true">·</span>
+            <span className="break-all">wss://agent.deepgram.com/v1/agent/converse</span>
           </div>
         </div>
       </footer>
-
     </div>
   );
 }

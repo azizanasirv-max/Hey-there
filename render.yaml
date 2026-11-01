@@ -1,0 +1,36 @@
+# Render Blueprint for the Deepgram Voice Agent prototype (Hey-there).
+#
+# One Node web service that does double duty:
+#   * serves the built React client (dist/) as static assets, and
+#   * terminates the browser WebSocket and proxies it to Deepgram with the
+#     server-side DEEPGRAM_API_KEY (the browser never sees the key).
+#
+# Deploy: Render Dashboard → New → Blueprint → pick this repo/branch, then set
+# the secret DEEPGRAM_API_KEY (marked `sync: false`, so it is never stored in
+# git). See docs/DEPLOYMENT.md for the full runbook and verification steps.
+services:
+  - type: web
+    name: hey-there
+    runtime: node
+    plan: free
+    region: oregon
+    branch: main
+    # `--include=dev` is explicit on purpose: NODE_ENV=production is set for the
+    # service, and npm would otherwise skip vite/esbuild/typescript at build time.
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    # A 200 with status:"ok" and no-store headers; Render restarts the instance
+    # if this stops answering, so a dead proxy never stays in the pool.
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      # Vite 8 / @vitejs/plugin-react 6 need Node >= 20.19 or >= 22.12.
+      - key: NODE_VERSION
+        value: 22.14.0
+      # Production mode = serve dist/ + no Vite dev middleware.
+      - key: NODE_ENV
+        value: production
+      # SECRET — set it in the Render dashboard ("Environment" → add variable).
+      # Never commit a real key; `.env.example` only documents the name.
+      - key: DEEPGRAM_API_KEY
+        sync: false

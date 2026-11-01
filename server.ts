@@ -1,331 +1,587 @@
 import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
+import { existsSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 
-dotenv.config();
+import {
+  AgentModelConfig,
+  DEFAULT_AGENT_CONFIG,
+  DEFAULT_AGENT_WS_URL,
+  buildValidatedSettings,
+  normalizeAgentConfig,
+} from './src/shared/voiceAgentConfig';
+
+// `quiet` keeps dotenv's v17 banner out of structured production logs.
+dotenv.config({ quiet: true });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+/** Max time we wait for the browser's ConfigureSettings before using defaults. */
+const SETTINGS_WAIT_MS = 1200;
+/** Upstream connect timeout — prevents an endless "CONNECTING" state. */
+const UPSTREAM_CONNECT_TIMEOUT_MS = 12000;
+/**
+ * Voice Agent closes sockets that go silent (`CLIENT_MESSAGE_TIMEOUT`), so we
+ * relay a `KeepAlive` upstream when no microphone audio was forwarded for this
+ * long. The documented cadence is one KeepAlive every 8 s while idle.
+ */
+const CLIENT_AUDIO_IDLE_KEEPALIVE_MS = Number(process.env.PROXY_IDLE_KEEPALIVE_MS || 8000);
+/** Aggregate agent-audio telemetry instead of one JSON message per frame. */
+const AUDIO_STATS_INTERVAL_MS = 1000;
+/** Liveness ping for the browser socket (detects dead TCP, frees upstream sockets). */
+const CLIENT_PING_INTERVAL_MS = 20000;
+/** Back-pressure guard: drop microphone frames rather than buffer unboundedly. */
+const MAX_UPSTREAM_BUFFERED_BYTES = 1_000_000;
+const MAX_CLIENT_BUFFERED_BYTES = 2_000_000;
+/** Where the production client build lives (written by `npm run build`). */
+const CLIENT_DIST_DIR = path.join(__dirname, 'dist');
+const CLIENT_INDEX_FILE = path.join(CLIENT_DIST_DIR, 'index.html');
+/** Path the browser dials for the Voice Agent session (see src/utils/voiceAgentSession.ts). */
+const WS_PATH = '/api/agent-proxy';
+
+type Labelled = { at: number; label: string };
+
+function nowMs() {
+  return Date.now();
+}
+
+function logLatency(label: string, since?: Labelled | null) {
+  if (!since) return;
+  console.log(`[Latency] ${label}: ${nowMs() - since.at} ms`);
+}
 
 async function startServer() {
   const app = express();
   const server = createServer(app);
   const isProd = process.env.NODE_ENV === 'production';
-  const PORT = process.env.PORT || 3000;
+  const parsedPort = Number(process.env.PORT);
+  const PORT = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : 3000;
+  /** Render/Cloud Run/Docker route traffic to 0.0.0.0, never to localhost only. */
+  const HOST = process.env.HOST?.trim() || '0.0.0.0';
+  const agentUrl = process.env.DEEPGRAM_AGENT_URL?.trim() || DEFAULT_AGENT_WS_URL;
 
-  app.use(express.json());
+  // Render terminates TLS at its edge and forwards `X-Forwarded-Proto/Host`.
+  // Trusting one proxy hop makes `req.protocol` / `req.ip` / `req.hostname`
+  // truthful (and keeps `wss://` upgrades diagnosable) without trusting a
+  // client-supplied header.
+  app.set('trust proxy', 1);
+  app.disable('x-powered-by');
+
+  app.use(express.json({ limit: '256kb' }));
+
+  // Minimal hardening headers (no extra dependency): the app is HTML + assets,
+  // never user-uploaded content, so sniffing/framing protection is enough.
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    next();
+  });
 
   // Health endpoint for backend & API key status verification
   app.get('/api/health', (req, res) => {
+    // Never let an intermediary cache a readiness probe: a cached 200/202
+    // is indistinguishable from a live backend.
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.set('X-Agent-Proxy', 'deepgram-voice-agent');
     const rawKey = process.env.DEEPGRAM_API_KEY;
     const hasApiKey = Boolean(rawKey && rawKey.trim().length > 0 && !rawKey.includes('your_actual'));
-    const maskedKey = hasApiKey 
-      ? `${rawKey!.trim().substring(0, 4)}...${rawKey!.trim().slice(-4)}`
-      : null;
+    const maskedKey = hasApiKey ? `${rawKey!.trim().substring(0, 4)}...${rawKey!.trim().slice(-4)}` : null;
 
     res.json({
       status: 'ok',
       deepgramApiKeyConfigured: hasApiKey,
       maskedKey,
+      agentUrl,
       timestamp: new Date().toISOString(),
       uptime: process.uptime(),
-      environment: process.env.NODE_ENV || 'development'
+      environment: process.env.NODE_ENV || 'development',
+      // Deployment self-description: lets an operator prove from `curl` which
+      // mode (Vite dev middleware vs built assets) and endpoint the service uses.
+      serving: isProd ? 'static-dist' : 'vite-dev-middleware',
+      webSocketPath: WS_PATH,
+      nodeVersion: process.version,
+      commit: process.env.RENDER_GIT_COMMIT?.slice(0, 7) || process.env.GIT_COMMIT?.slice(0, 7) || null,
     });
   });
 
-  // Setup WebSocket Proxy on /api/agent-proxy
   const wss = new WebSocketServer({ noServer: true });
 
   server.on('upgrade', (request, socket, head) => {
-    const host = request.headers.host || 'localhost';
-    const url = new URL(request.url || '', `http://${host}`);
-    
-    if (url.pathname === '/api/agent-proxy') {
+    // Parse the path on a synthetic origin: the Host header may arrive from a
+    // load balancer and must never be able to change which route matches.
+    let pathname = '';
+    try {
+      pathname = new URL(request.url || '/', 'http://localhost').pathname;
+    } catch {
+      pathname = '';
+    }
+    if (pathname === WS_PATH) {
       wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit('connection', ws, request);
       });
-    } else {
-      socket.destroy();
+      return;
     }
+    // Answer instead of silently destroying the socket: a wrong path must be
+    // visible in the browser/network tab, not an opaque connection reset.
+    console.warn(`[Proxy] Rejected WebSocket upgrade for unknown path: ${request.url}`);
+    try {
+      socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+    } catch {
+      /* ignore */
+    }
+    socket.destroy();
   });
 
-  // Handle client WebSocket connections from browser
-  wss.on('connection', (clientWs, req) => {
+  wss.on('connection', (clientWs: WebSocket) => {
     console.log('[Proxy] Client browser connected to /api/agent-proxy');
-    
-    let deepgramWs: WebSocket | null = null;
-    let isSettingsApplied = false;
-    let discardedAudioFrames = 0;
-    let discardedAudioBytes = 0;
-    let audioFramesSent = 0;
 
+    const connectedAt: Labelled = { at: nowMs(), label: 'client-connected' };
     const apiKey = process.env.DEEPGRAM_API_KEY?.trim();
 
     if (!apiKey || apiKey.includes('your_actual')) {
       console.warn('[Proxy] Connection rejected: DEEPGRAM_API_KEY missing or placeholder.');
-      clientWs.send(JSON.stringify({
-        type: 'Error',
-        code: 'API_KEY_MISSING',
-        description: 'DEEPGRAM_API_KEY environment variable is missing on the server. Please configure DEEPGRAM_API_KEY.',
-        message: 'DEEPGRAM_API_KEY environment variable is missing on the server.'
-      }));
+      clientWs.send(
+        JSON.stringify({
+          type: 'Error',
+          code: 'API_KEY_MISSING',
+          description:
+            'DEEPGRAM_API_KEY environment variable is missing on the server. Add it to .env and restart the server.',
+          message: 'DEEPGRAM_API_KEY environment variable is missing on the server.',
+        })
+      );
       clientWs.close(1008, 'API Key missing');
       return;
     }
 
-    // Default configuration strictly complying with official Deepgram Voice Agent Settings schema
-    // https://developers.deepgram.com/docs/voice-agent-settings
-    let modelConfig = {
-      listenProvider: 'deepgram',
-      listenModel: 'nova-3',
-      thinkProvider: 'open_ai',
-      thinkModel: 'gpt-4o-mini',
-      speakProvider: 'deepgram',
-      speakModel: 'flux-kit-en',
-      speakVersion: 'v2',
-      sampleRate: 24000,
-      encoding: 'linear16'
+    let modelConfig: AgentModelConfig = { ...DEFAULT_AGENT_CONFIG };
+    let deepgramWs: WebSocket | null = null;
+    let isSettingsApplied = false;
+    let settingsMessageSent = false;
+    let clientClosed = false;
+    let isAlive = true;
+
+    // Latency/telemetry counters
+    let welcomeAt: Labelled | null = null;
+    let settingsSentAt: Labelled | null = null;
+    let firstAgentAudioAt: Labelled | null = null;
+    let audioFramesFromClient = 0;
+    let audioBytesFromClient = 0;
+    let audioFramesDropped = 0;
+    let agentAudioFrames = 0;
+    let agentAudioBytes = 0;
+    let agentAudioFramesDropped = 0;
+    let lastClientAudioAt = 0;
+    let statsDirty = false;
+
+    // Client configuration race fix: buffer Welcome until the browser's
+    // ConfigureSettings arrives (or SETTINGS_WAIT_MS elapses).
+    let welcomeReceived = false;
+    let clientConfigReceived = false;
+    let settingsWaitTimer: ReturnType<typeof setTimeout> | null = null;
+    let statsTimer: ReturnType<typeof setInterval> | null = null;
+    let keepAliveTimer: ReturnType<typeof setInterval> | null = null;
+    let pingTimer: ReturnType<typeof setInterval> | null = null;
+    let upstreamConnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const sendClient = (payload: Record<string, unknown>): boolean => {
+      if (clientWs.readyState !== WebSocket.OPEN) return false;
+      if (clientWs.bufferedAmount > MAX_CLIENT_BUFFERED_BYTES) return false;
+      try {
+        clientWs.send(JSON.stringify(payload));
+        return true;
+      } catch (err) {
+        console.error('[Proxy] Failed to send message to client:', err);
+        return false;
+      }
     };
 
-    const buildOfficialSettingsMessage = () => {
-      return {
-        type: 'Settings', // Strictly "Settings", never "SettingsConfiguration"
-        audio: {
-          input: {
-            encoding: modelConfig.encoding,
-            sample_rate: modelConfig.sampleRate
-          },
-          output: {
-            encoding: 'linear16',
-            sample_rate: 24000,
-            container: 'none'
-          }
-        },
-        agent: {
-          listen: {
-            provider: {
-              type: modelConfig.listenProvider,
-              model: modelConfig.listenModel
-            }
-          },
-          think: {
-            provider: {
-              type: modelConfig.thinkProvider,
-              model: modelConfig.thinkModel
-            }
-          },
-          speak: {
-            provider: {
-              type: modelConfig.speakProvider,
-              model: modelConfig.speakModel,
-              version: modelConfig.speakVersion || 'v2'
-            }
-          }
-        }
-      };
+    const clearTimers = () => {
+      for (const t of [settingsWaitTimer, statsTimer, keepAliveTimer, pingTimer, upstreamConnectTimer]) {
+        if (t) clearTimeout(t as ReturnType<typeof setTimeout>);
+      }
+      settingsWaitTimer = statsTimer = keepAliveTimer = pingTimer = upstreamConnectTimer = null;
     };
 
-    // Connect to Deepgram Agent API
+    const emitAudioStats = () => {
+      if (!statsDirty) return;
+      statsDirty = false;
+      sendClient({
+        type: 'AgentAudioStats',
+        frames: agentAudioFrames,
+        bytes: agentAudioBytes,
+        droppedFrames: agentAudioFramesDropped,
+        inputFrames: audioFramesFromClient,
+        inputBytes: audioBytesFromClient,
+        inputDroppedFrames: audioFramesDropped,
+        firstAudioDelayMs: firstAgentAudioAt && settingsSentAt ? firstAgentAudioAt.at - settingsSentAt.at : null,
+        timestamp: new Date().toISOString(),
+      });
+    };
+
+    /**
+     * Send the single `Settings` message, after the browser has supplied its
+     * model configuration. Never sends twice (`SETTINGS_ALREADY_APPLIED`).
+     */
+    const maybeSendSettings = (reason: string) => {
+      if (settingsMessageSent || !welcomeReceived || !clientConfigReceived) return;
+      if (!deepgramWs || deepgramWs.readyState !== WebSocket.OPEN) return;
+      if (settingsWaitTimer) {
+        clearTimeout(settingsWaitTimer);
+        settingsWaitTimer = null;
+      }
+
+      // Validate + repair before sending, so a stale/invalid model id can never
+      // turn into a fatal `INVALID_SETTINGS` error mid-session.
+      const validated = buildValidatedSettings(modelConfig);
+      const payload = validated.settings;
+      modelConfig = validated.config;
+      for (const warning of validated.warnings) {
+        console.warn(`[Proxy] Settings corrected: ${warning}`);
+        sendClient({ type: 'Warning', code: 'SETTINGS_CORRECTED', description: warning });
+      }
+      settingsMessageSent = true;
+      settingsSentAt = { at: nowMs(), label: 'settings-sent' };
+      deepgramWs.send(JSON.stringify(payload));
+      console.log(`[Proxy -> Deepgram] Settings sent (${reason}): ${JSON.stringify(modelConfig)}`);
+      sendClient({ type: 'ProxyStatus', status: 'SettingsSent', settings: payload, warnings: validated.warnings });
+    };
+
+    const applyClientConfig = (rawConfig: unknown) => {
+      // Values are normalized here and validated right before `Settings` is sent.
+      modelConfig = normalizeAgentConfig(rawConfig, DEFAULT_AGENT_CONFIG);
+      clientConfigReceived = true;
+      console.log('[Proxy] Model configuration received from browser:', modelConfig);
+      maybeSendSettings('client configuration');
+    };
+
+    // ------------------------------------------------------- upstream socket
     try {
-      console.log('[Proxy -> Deepgram] Connecting to wss://agent.deepgram.com/v1/agent/converse');
-      deepgramWs = new WebSocket('wss://agent.deepgram.com/v1/agent/converse', {
-        headers: {
-          'Authorization': `Token ${apiKey}`
-        }
+      console.log(`[Proxy -> Deepgram] Connecting to ${agentUrl}`);
+      deepgramWs = new WebSocket(agentUrl, {
+        headers: { Authorization: `Token ${apiKey}` },
       });
     } catch (err: any) {
       console.error('[Proxy -> Deepgram] Failed to construct WebSocket:', err);
-      clientWs.send(JSON.stringify({
+      sendClient({
         type: 'Error',
         code: 'CONNECTION_FAILED',
         description: `Failed to open Deepgram WebSocket: ${err.message}`,
-        message: err.message
-      }));
+        message: err.message,
+      });
       clientWs.close(1011, 'Connection error');
       return;
     }
 
-    // 1. Deepgram socket open
-    deepgramWs.on('open', () => {
-      console.log('[Proxy <- Deepgram] WebSocket connection established successfully.');
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(JSON.stringify({
-          type: 'ProxyStatus',
-          status: 'DeepgramConnected',
-          message: 'Connected to Deepgram Voice Agent API (wss://agent.deepgram.com/v1/agent/converse). Awaiting Welcome message...'
-        }));
+    upstreamConnectTimer = setTimeout(() => {
+      if (isSettingsApplied) return;
+      console.error('[Proxy -> Deepgram] Upstream connect timeout');
+      sendClient({
+        type: 'Error',
+        code: 'UPSTREAM_TIMEOUT',
+        description: `Deepgram did not accept the connection within ${UPSTREAM_CONNECT_TIMEOUT_MS} ms.`,
+      });
+      try {
+        deepgramWs?.close(1011, 'upstream timeout');
+      } catch {
+        /* ignore */
       }
+    }, UPSTREAM_CONNECT_TIMEOUT_MS);
+
+    deepgramWs.on('open', () => {
+      console.log('[Proxy <- Deepgram] WebSocket connection established.');
+      if (upstreamConnectTimer) {
+        clearTimeout(upstreamConnectTimer);
+        upstreamConnectTimer = null;
+      }
+      sendClient({
+        type: 'ProxyStatus',
+        status: 'DeepgramConnected',
+        message: 'Connected to Deepgram Voice Agent API. Awaiting Welcome message...',
+      });
     });
 
-    // 2. Incoming messages from Deepgram
+    // Agent (TTS) audio: forward to the browser instead of discarding it.
     deepgramWs.on('message', (data: WebSocket.Data, isBinary: boolean) => {
       if (isBinary) {
-        // BINARY AUDIO DISCARD REQUIREMENT:
-        // Discard generated audio frames immediately. Do not play, store or forward to frontend.
-        discardedAudioFrames++;
-        const byteLen = Buffer.isBuffer(data) ? data.length : (data as ArrayBuffer).byteLength || 0;
-        discardedAudioBytes += byteLen;
-
-        // Send periodic/aggregated telemetry update to browser
-        if (clientWs.readyState === WebSocket.OPEN) {
-          clientWs.send(JSON.stringify({
-            type: 'AudioDiscardedTelemetry',
-            frames: discardedAudioFrames,
-            bytes: discardedAudioBytes,
-            lastFrameBytes: byteLen,
-            timestamp: new Date().toISOString()
-          }));
+        const frame = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
+        agentAudioFrames++;
+        agentAudioBytes += frame.length;
+        if (!firstAgentAudioAt) {
+          firstAgentAudioAt = { at: nowMs(), label: 'first-agent-audio' };
+          logLatency('SettingsApplied -> first agent audio byte', settingsSentAt);
         }
-        return; // DISCARD AUDIO
+        statsDirty = true;
+
+        if (clientWs.readyState !== WebSocket.OPEN) {
+          agentAudioFramesDropped++;
+          return;
+        }
+        if (clientWs.bufferedAmount > MAX_CLIENT_BUFFERED_BYTES) {
+          // Client cannot keep up: drop rather than grow memory without bound.
+          agentAudioFramesDropped++;
+          return;
+        }
+        try {
+          clientWs.send(frame, { binary: true });
+        } catch (err) {
+          agentAudioFramesDropped++;
+          console.error('[Proxy] Failed to forward agent audio frame:', err);
+        }
+        return;
       }
 
-      // Handle JSON text events from Deepgram
       try {
         const textStr = data.toString('utf-8');
         const json = JSON.parse(textStr);
-        console.log(`[Proxy <- Deepgram] Incoming event type: ${json.type}`);
 
         if (json.type === 'Welcome') {
-          console.log(`[Proxy <- Deepgram] Welcome received (session_id: ${json.session_id})`);
-
-          // Send exact official Settings message
-          const settingsPayload = buildOfficialSettingsMessage();
-          console.log('[Proxy -> Deepgram] Outgoing Frame: TEXT, Type: Settings, Payload:', JSON.stringify(settingsPayload, null, 2));
-
-          if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN) {
-            deepgramWs.send(JSON.stringify(settingsPayload));
-            if (clientWs.readyState === WebSocket.OPEN) {
-              clientWs.send(JSON.stringify({
-                type: 'ProxyStatus',
-                status: 'SettingsSent',
-                settings: settingsPayload
-              }));
-            }
+          welcomeAt = { at: nowMs(), label: 'welcome' };
+          console.log(`[Proxy <- Deepgram] Welcome (request_id=${json.request_id || 'n/a'})`);
+          logLatency('client-connected -> Welcome', connectedAt);
+          welcomeReceived = true;
+          // Do not send Settings from defaults: wait briefly for the browser's
+          // model configuration so the UI and the session cannot disagree.
+          if (clientConfigReceived) {
+            maybeSendSettings('configuration already received');
+          } else {
+            settingsWaitTimer = setTimeout(() => {
+              if (clientConfigReceived || settingsMessageSent) return;
+              console.warn(
+                `[Proxy] No ConfigureSettings from browser after ${SETTINGS_WAIT_MS} ms - using defaults.`
+              );
+              clientConfigReceived = true;
+              maybeSendSettings('settings wait timeout');
+            }, SETTINGS_WAIT_MS);
           }
         } else if (json.type === 'SettingsApplied') {
           isSettingsApplied = true;
-          console.log('[Proxy <- Deepgram] SettingsApplied received. Ready to stream microphone audio frames.');
-          if (clientWs.readyState === WebSocket.OPEN) {
-            clientWs.send(JSON.stringify({
-              type: 'SessionReady',
-              message: 'Deepgram SettingsApplied verified. Real-time microphone audio stream unlocked.'
-            }));
+          // Arm the idle-keepalive watchdog even if the browser never sends a frame.
+          if (lastClientAudioAt === 0) lastClientAudioAt = nowMs();
+          if (upstreamConnectTimer) {
+            clearTimeout(upstreamConnectTimer);
+            upstreamConnectTimer = null;
           }
+          console.log('[Proxy <- Deepgram] SettingsApplied — microphone audio unlocked.');
+          logLatency('settings sent -> SettingsApplied', settingsSentAt);
+          sendClient({
+            type: 'SessionReady',
+            message: 'Deepgram SettingsApplied verified. Real-time microphone audio stream unlocked.',
+          });
+        } else if (json.type === 'LatencyReport') {
+          console.log(
+            `[Latency] Deepgram turn report: stt=${json.stt_latency ?? '-'}s ` +
+              `ttt=${json.ttt_token_latency ?? '-'}s tts=${json.tts_latency ?? '-'}s total=${json.total_latency ?? '-'}s`
+          );
         } else if (json.type === 'Error') {
           console.error(`[Proxy <- Deepgram] FATAL ERROR: code=${json.code}, description=${json.description}`);
-          if (json.code === 'UNPARSABLE_CLIENT_MESSAGE') {
-            console.error('[Proxy <- Deepgram] UNPARSABLE_CLIENT_MESSAGE details:', JSON.stringify(json));
-          }
-
-          // Forward error to client
           if (clientWs.readyState === WebSocket.OPEN) {
-            clientWs.send(JSON.stringify(json));
+            clientWs.send(textStr);
           }
-
-          // Protect usage and costs: close connection immediately on fatal protocol error
-          console.warn('[Proxy] Terminating Deepgram connection due to fatal error.');
-          if (deepgramWs) {
-            deepgramWs.close(1011, 'Deepgram Error');
-            deepgramWs = null;
-          }
-          if (clientWs.readyState === WebSocket.OPEN) {
-            clientWs.close(1011, 'Deepgram Error');
+          // Docs: every `Error` is fatal; close so the browser can reconnect cleanly.
+          try {
+            deepgramWs?.close(1011, 'Deepgram Error');
+          } catch {
+            /* ignore */
           }
           return;
+        } else if (json.type === 'Warning') {
+          console.warn(`[Proxy <- Deepgram] Warning: code=${json.code}, description=${json.description}`);
         }
 
-        // Forward Deepgram JSON event to browser
         if (clientWs.readyState === WebSocket.OPEN) {
           clientWs.send(textStr);
         }
-      } catch (err: any) {
-        console.error('[Proxy] Error parsing Deepgram JSON event:', err);
+      } catch (err) {
+        console.error('[Proxy] Error parsing Deepgram message:', err);
       }
     });
 
-    // 3. Deepgram socket errors & close
     deepgramWs.on('error', (err: Error) => {
       console.error('[Proxy <- Deepgram] WebSocket error:', err.message);
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(JSON.stringify({
-          type: 'Error',
-          code: 'WEBSOCKET_ERROR',
-          description: `Deepgram API Error: ${err.message}`,
-          message: err.message
-        }));
-      }
+      sendClient({
+        type: 'Error',
+        code: 'WEBSOCKET_ERROR',
+        description: `Deepgram API Error: ${err.message}`,
+        message: err.message,
+      });
     });
 
     deepgramWs.on('close', (code, reason) => {
       const reasonStr = reason?.toString() || 'Deepgram closed socket';
       console.log(`[Proxy <- Deepgram] Connection closed: code=${code}, reason=${reasonStr}`);
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(JSON.stringify({
-          type: 'ProxyStatus',
-          status: 'Disconnected',
-          code,
-          reason: reasonStr
-        }));
-        clientWs.close();
-      }
+      isSettingsApplied = false;
+      sendClient({ type: 'ProxyStatus', status: 'Disconnected', code, reason: reasonStr });
+      if (clientWs.readyState === WebSocket.OPEN) clientWs.close(1000, reasonStr.slice(0, 120));
     });
 
-    // 4. Handle incoming messages from browser client
+    // -------------------------------------------------- browser -> upstream
     clientWs.on('message', (message: WebSocket.Data, isBinary: boolean) => {
       if (isBinary) {
-        // Forward browser microphone binary PCM audio to Deepgram ONLY AFTER SettingsApplied
-        if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN && isSettingsApplied) {
-          audioFramesSent++;
-          if (audioFramesSent === 1 || audioFramesSent % 50 === 0) {
-            console.log(`[Proxy -> Deepgram] Outgoing Frame: BINARY audio frame #${audioFramesSent} (${(message as Buffer).length} bytes)`);
-          }
-          deepgramWs.send(message, { binary: true });
-        } else if (!isSettingsApplied) {
-          // Audio sent before SettingsApplied -> Drop to prevent UNPARSABLE_CLIENT_MESSAGE or protocol violation
-          // console.log('[Proxy] Dropping audio chunk: SettingsApplied not yet received.');
+        if (!deepgramWs || deepgramWs.readyState !== WebSocket.OPEN || !isSettingsApplied) {
+          audioFramesDropped++;
+          return;
         }
-      } else {
-        // Handle control messages from browser
+        const frame = Buffer.isBuffer(message) ? message : Buffer.from(message as ArrayBuffer);
+        if (deepgramWs.bufferedAmount > MAX_UPSTREAM_BUFFERED_BYTES) {
+          audioFramesDropped++;
+          return;
+        }
+        audioFramesFromClient++;
+        audioBytesFromClient += frame.length;
+        lastClientAudioAt = nowMs();
+        statsDirty = true;
         try {
-          const textStr = message.toString('utf-8');
-          const json = JSON.parse(textStr);
-
-          // INTERNAL BROWSER-TO-PROXY CONTROL MESSAGE: Never forward ConfigureSettings to Deepgram!
-          if (json.type === 'ConfigureSettings') {
-            if (json.config) {
-              modelConfig = { ...modelConfig, ...json.config };
-              console.log('[Proxy] Updated modelConfig from browser client:', modelConfig);
-            }
-          } else if (json.type === 'InjectText' || json.type === 'InjectUserMessage') {
-            // Forward valid Deepgram InjectUserMessage
-            if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN && isSettingsApplied) {
-              const injectPayload = {
-                type: 'InjectUserMessage',
-                content: json.content || json.text || ''
-              };
-              console.log('[Proxy -> Deepgram] Outgoing Frame: TEXT, Type: InjectUserMessage, Payload:', injectPayload);
-              deepgramWs.send(JSON.stringify(injectPayload));
-            }
-          } else {
-            console.warn('[Proxy] Ignoring unknown client text message type:', json.type);
-          }
-        } catch (e) {
-          console.error('[Proxy] Failed to parse browser text message:', e);
+          deepgramWs.send(frame, { binary: true });
+        } catch (err) {
+          audioFramesDropped++;
+          console.error('[Proxy] Failed to forward microphone frame:', err);
         }
+        return;
+      }
+
+      try {
+        const json = JSON.parse(message.toString('utf-8'));
+        switch (json.type) {
+          case 'ConfigureSettings':
+            applyClientConfig(json.config);
+            break;
+          case 'InjectText':
+          case 'InjectUserMessage': {
+            if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN && isSettingsApplied) {
+              const content = json.content || json.text || '';
+              if (content) {
+                deepgramWs.send(JSON.stringify({ type: 'InjectUserMessage', content }));
+                console.log('[Proxy -> Deepgram] InjectUserMessage:', content.slice(0, 80));
+              }
+            } else {
+              sendClient({
+                type: 'Warning',
+                code: 'SESSION_NOT_READY',
+                description: 'Text injection ignored: the session is not ready yet.',
+              });
+            }
+            break;
+          }
+          case 'KeepAlive':
+            // Protocol rule: nothing except `Settings` may be sent before
+            // `SettingsApplied` (`NON_SETTINGS_MESSAGE_BEFORE_SETTINGS`).
+            if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN && isSettingsApplied) {
+              deepgramWs.send(JSON.stringify({ type: 'KeepAlive' }));
+              lastClientAudioAt = nowMs();
+            }
+            break;
+          case 'Ping':
+            sendClient({ type: 'Pong', timestamp: nowMs() });
+            break;
+          default:
+            console.warn('[Proxy] Ignoring unknown client text message type:', json.type);
+        }
+      } catch (err) {
+        console.error('[Proxy] Failed to parse browser text message:', err);
+        sendClient({
+          type: 'Warning',
+          code: 'MALFORMED_CLIENT_MESSAGE',
+          description:
+            'A client message was not valid JSON and was dropped. The proxy never forwards unparsable frames upstream.',
+        });
       }
     });
 
-    clientWs.on('close', () => {
-      console.log('[Proxy] Client browser disconnected. Cleaning up Deepgram WebSocket.');
-      if (deepgramWs) {
-        if (deepgramWs.readyState === WebSocket.OPEN || deepgramWs.readyState === WebSocket.CONNECTING) {
-          deepgramWs.close(1000, 'Client disconnected');
+    // --------------------------------------------- timers (stats + keepalive)
+    statsTimer = setInterval(() => {
+      // Aggregate audio counters once per second (never per frame).
+      emitAudioStats();
+      // If the browser is not sending audio (muted, tab throttled, network
+      // stalled) keep the Deepgram session alive explicitly: the Voice Agent
+      // closes sockets that go silent (`CLIENT_MESSAGE_TIMEOUT`).
+      if (
+        deepgramWs &&
+        deepgramWs.readyState === WebSocket.OPEN &&
+        isSettingsApplied &&
+        lastClientAudioAt > 0 &&
+        nowMs() - lastClientAudioAt >= CLIENT_AUDIO_IDLE_KEEPALIVE_MS
+      ) {
+        try {
+          deepgramWs.send(JSON.stringify({ type: 'KeepAlive' }));
+        } catch {
+          /* socket closing */
         }
-        deepgramWs = null;
+        lastClientAudioAt = nowMs();
       }
+    }, AUDIO_STATS_INTERVAL_MS);
+
+    // Detect a dead browser socket so the upstream (paid) socket is released.
+    clientWs.on('pong', () => {
+      isAlive = true;
+    });
+    pingTimer = setInterval(() => {
+      if (!isAlive) {
+        console.warn('[Proxy] Client socket unresponsive - terminating.');
+        clientWs.terminate();
+        return;
+      }
+      isAlive = false;
+      try {
+        clientWs.ping();
+      } catch {
+        /* ignore */
+      }
+    }, CLIENT_PING_INTERVAL_MS);
+
+    const cleanup = (why: string) => {
+      if (clientClosed) return;
+      clientClosed = true;
+      console.log(`[Proxy] Cleaning up session (${why}).`);
+      clearTimers();
+      emitAudioStats();
+      const dg = deepgramWs;
+      deepgramWs = null;
+      if (dg && (dg.readyState === WebSocket.OPEN || dg.readyState === WebSocket.CONNECTING)) {
+        try {
+          dg.close(1000, 'client closed');
+        } catch {
+          /* ignore */
+        }
+      }
+      if (clientWs.readyState === WebSocket.OPEN) clientWs.close(1000, 'cleanup');
+    };
+
+    clientWs.on('close', () => cleanup('browser disconnected'));
+    clientWs.on('error', (err) => {
+      console.error('[Proxy] Client socket error:', err.message);
+      cleanup('client error');
+    });
+  });
+
+  // ---------------------------------------------------------------- HTTP routes
+  //
+  // Explicit API guards *before* the SPA fallback. Without these, a plain HTTP
+  // request to the WebSocket endpoint (or a typo'd API path) is answered with
+  // `200 text/html` (the SPA), which hides routing/proxy misconfiguration and
+  // looks like a successful API call to any client that only checks `res.ok`.
+  app.all('/api/agent-proxy', (req, res) => {
+    // RFC 7231 §6.5.15: the resource only exists over an upgraded connection.
+    // 426 is the correct answer to an HTTP request that cannot be upgraded — not
+    // 200, and not 202 (202 would imply we accepted it asynchronously).
+    res.set('Cache-Control', 'no-store');
+    res.set('Upgrade', 'websocket');
+    res.status(426).json({
+      error: 'UPGRADE_REQUIRED',
+      message:
+        'This endpoint only accepts a WebSocket upgrade (HTTP 101 Switching Protocols). ' +
+        'Use ws:// or wss:// — a plain HTTP GET cannot open a Voice Agent session.',
+    });
+  });
+
+  app.all('/api/*', (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.status(404).json({
+      error: 'NOT_FOUND',
+      message: `No such API route: ${req.method} ${req.path}`,
     });
   });
 
@@ -334,18 +590,98 @@ async function startServer() {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
-      appType: 'spa'
+      appType: 'spa',
     });
     app.use(vite.middlewares);
+    console.log('[Server] Dev mode: serving sources through Vite middleware (no build required).');
   } else {
-    app.use(express.static(path.join(__dirname, 'dist')));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+    // Production: serve the built client. Hashed assets are immutable, while
+    // index.html must never be cached or a deploy cannot reach an open tab.
+    if (!existsSync(CLIENT_INDEX_FILE)) {
+      console.error(
+        `[Server] FATAL: production mode but ${CLIENT_INDEX_FILE} is missing. ` +
+          'Run `npm run build` (vite build) before starting, or set NODE_ENV=development.'
+      );
+      process.exit(1);
+    }
+    app.use(
+      express.static(CLIENT_DIST_DIR, {
+        index: false,
+        etag: true,
+        lastModified: true,
+        maxAge: '1h',
+        setHeaders: (res, filePath) => {
+          if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+            // Vite emits content-hashed filenames -> safe to cache forever.
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          } else if (filePath.endsWith('.html')) {
+            res.setHeader('Cache-Control', 'no-store, must-revalidate');
+          }
+        },
+      })
+    );
+    // SPA fallback: /prototype-1, /architecture and any deep link.
+    app.get('*', (req, res, next) => {
+      if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+      // A missing *asset* is a deploy problem, not a route: never answer it
+      // with index.html (that turns a 404 into a bogus 200 text/html and makes
+      // a half-uploaded build look healthy).
+      if (req.path.startsWith('/assets/')) {
+        res.status(404).type('text/plain').send('Asset not found');
+        return;
+      }
+      res.set('Cache-Control', 'no-store, must-revalidate');
+      res.sendFile(CLIENT_INDEX_FILE, (err) => {
+        if (err) next(err);
+      });
     });
+    console.log(`[Server] Production mode: serving built client from ${CLIENT_DIST_DIR}`);
   }
 
-  server.listen(Number(PORT), '0.0.0.0', () => {
-    console.log(`[Server] Deepgram Voice Agent Proxy running on http://0.0.0.0:${PORT}`);
+  // Last-resort error handler: never leak a stack trace to a browser, and keep
+  // API errors JSON so the client's status contract can diagnose them.
+  app.use((err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    console.error('[Server] Unhandled request error:', err);
+    if (res.headersSent) return;
+    if (req.path.startsWith('/api/')) {
+      res.status(500).json({ error: 'INTERNAL_ERROR', message: 'Internal server error.' });
+      return;
+    }
+    res.status(500).type('text/plain').send('Internal server error');
+  });
+
+  // Render sends SIGTERM when it replaces an instance. Drain cleanly so no
+  // browser is left holding a half-open (paid) upstream Voice Agent socket.
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[Server] ${signal} received — closing clients and HTTP server.`);
+    for (const client of wss.clients) {
+      try {
+        client.close(1001, 'server shutting down');
+      } catch {
+        /* ignore */
+      }
+    }
+    wss.close();
+    server.close(() => {
+      console.log('[Server] Shutdown complete.');
+      process.exit(0);
+    });
+    // Never hang a deploy: force-exit if sockets refuse to drain.
+    setTimeout(() => process.exit(0), 8000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+
+  return new Promise<void>((resolve) => {
+    server.listen(PORT, HOST, () => {
+      console.log(`[Server] Deepgram Voice Agent Proxy running on http://${HOST}:${PORT}`);
+      console.log(`[Server] Upstream agent endpoint: ${agentUrl}`);
+      console.log(`[Server] WebSocket path: ${WS_PATH} (ws:// for http, wss:// behind TLS)`);
+      resolve();
+    });
   });
 }
 
