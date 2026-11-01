@@ -31,11 +31,18 @@ Without `DEEPGRAM_API_KEY` the UI still loads, `/api/health` reports
 
 | Command | What it does |
 | --- | --- |
-| `bun run dev` / `bun run start` | Express + Vite dev server with the WS proxy |
-| `bun run build` | Production client build into `dist/` |
+| `bun run dev` / `npm run dev` | Express + Vite dev server with the WS proxy (no build needed) |
+| `bun run build` | Production build: `vite build` → `dist/`, then `esbuild` → `server.js` |
+| `bun run start` | Production server (`node server.js`, serves `dist/`; needs `NODE_ENV=production`) |
+| `bun run start:dev` | Same server from TypeScript sources via `tsx` (no build) |
 | `bun run lint` | `tsc --noEmit` |
-| `bun run test` | Node test runner: unit + proxy integration tests (`node --import tsx --test`) |
+| `bun run test` | Node test runner: unit + proxy/protocol integration + production tests |
+| `bun run test:unit` | Pure unit tests only (`pcm`, settings, playback, backoff, conversation, http) |
+| `bun run test:prod` | Builds, then boots the real `server.js` bundle: health, assets, 404/426, WS 101, wss behind TLS |
 | `bun run test:e2e` | Headless-Chromium end-to-end verification: audio + immediate ConversationText (fake mic, real proxy) |
+| `bun run test:e2e:prod` | Same in the built app served over **HTTPS + WSS** behind a local TLS terminator |
+| `bun run test:all` | lint → unit/integration → production → both browser suites |
+| `bun run verify:live -- https://…` | External verification of a deployed URL (health, assets, guards, WS 101) |
 | `bun run test:live` | Optional live Deepgram run (10 turns, real key required; prints SKIPPED without one) |
 | `bun run bench` | Measured before/after benchmark (`scripts/bench-pipeline.ts`) |
 
@@ -69,12 +76,29 @@ Measured latency before/after: [`docs/LATENCY_REPORT.md`](docs/LATENCY_REPORT.md
 ## Configuration
 
 Environment variables live in `.env` (see `.env.example`): `DEEPGRAM_API_KEY`
-(required), `PORT`, and the test-only `DEEPGRAM_AGENT_URL` /
+(required), `NODE_ENV`, `PORT`, `HOST`, and the test-only `DEEPGRAM_AGENT_URL` /
 `PROXY_IDLE_KEEPALIVE_MS` overrides.
 
 Model selection (listen / think / speak) is done in the UI under **Config
 Models** and is applied to the Deepgram `Settings` message by the proxy — the
 browser never holds the API key.
+
+## Deployment (Render)
+
+The repo ships a `render.yaml` blueprint: one **Node web service** that serves
+the built client and proxies the WebSocket.
+
+```bash
+npm run build                      # dist/ + server.js
+NODE_ENV=production npm start      # http://localhost:3000/prototype-1
+npm run verify:live -- https://<service>.onrender.com
+```
+
+Set `DEEPGRAM_API_KEY` (secret), `NODE_ENV=production` and `NODE_VERSION=22.14.0`
+in the Render dashboard; `PORT` is injected by the platform and the server binds
+`0.0.0.0`. Full runbook, required variables, expected log lines and live-URL
+verification: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+UI audit and accessibility fixes: [`docs/UI_REVIEW.md`](docs/UI_REVIEW.md).
 
 ### Lower-latency turn detection (optional)
 
@@ -87,17 +111,24 @@ provider or model defaults were changed by the reliability/latency work.
 ## Testing
 
 ```bash
-bun run test     # 80 tests: unit (pcm / settings / playback / backoff / conversation / http) + proxy + protocol integration
-bun run test:e2e # 32 browser checks with a fake microphone (needs Chromium)
-bun run bench    # runs the original server (git commit ad474ee) side-by-side with the fix
+npm run lint       # tsc --noEmit
+npm run test       # 87 tests: unit + proxy/protocol integration + production bundle
+npm run test:prod  # builds, then boots server.js (health, assets, 404/426, WS 101, wss)
+npm run test:e2e   # 32 browser checks with a fake microphone (needs Chromium)
+npm run test:e2e:prod # 21 browser checks against the built app over HTTPS + WSS
+npm run test:all   # everything above, in order
+npm run bench      # runs the original server (git commit ad474ee) side-by-side with the fix
 ```
 
 The proxy integration tests boot the **real** `server.ts` as a child process and
 point it at a local mock that speaks Deepgram's documented wire protocol. They
 verify the handshake, the settings race, binary audio relay in both directions,
 telemetry aggregation, keep-alive, error/warning handling and socket cleanup.
+`tests/production.test.ts` repeats the critical subset against the **built
+bundle** (`node server.js`) and additionally drives `wss://` through a local
+TLS-terminating proxy, which is the topology Render uses.
 
-They do **not** prove Deepgram itself works — that requires a real
-`DEEPGRAM_API_KEY` and a browser with a microphone. See
+None of this proves Deepgram itself works — that requires a real
+`DEEPGRAM_API_KEY` and a browser with a microphone (`npm run test:live`). See
 [`docs/LATENCY_REPORT.md`](docs/LATENCY_REPORT.md#limitations) for what could not
 be executed in this environment.

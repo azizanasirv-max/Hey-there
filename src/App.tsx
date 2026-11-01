@@ -927,10 +927,10 @@ export default function App() {
       <footer className="border-t border-slate-900 bg-slate-950 py-4 text-center text-xs text-slate-500">
         <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
           <div>Deepgram Voice Agent API Prototype 1 · Node.js Express WebSocket Proxy</div>
-          <div className="font-mono text-[11px] text-slate-600 flex items-center gap-3">
+          <div className="font-mono text-[11px] text-slate-600 flex flex-wrap items-center justify-center gap-x-2 gap-y-1 max-w-full">
             <span>Route: /prototype-1</span>
-            <span>·</span>
-            <span>wss://agent.deepgram.com/v1/agent/converse</span>
+            <span aria-hidden="true">·</span>
+            <span className="break-all">wss://agent.deepgram.com/v1/agent/converse</span>
           </div>
         </div>
       </footer>

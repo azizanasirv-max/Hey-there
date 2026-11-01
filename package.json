@@ -20,7 +20,8 @@
     "test:e2e": "node --import tsx tests/e2e/audio.e2e.ts",
     "test:e2e:prod": "npm run build && node --import tsx tests/e2e/production.e2e.ts",
     "test:all": "npm run lint && npm run test && npm run test:prod && npm run test:e2e && npm run test:e2e:prod",
-    "test:live": "node --import tsx scripts/live-latency.ts"
+    "test:live": "node --import tsx scripts/live-latency.ts",
+    "verify:live": "node --import tsx scripts/verify-deployment.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
