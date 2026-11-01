@@ -26,6 +26,16 @@ HTTP `202` success-in-progress contract.
 | 16 | No `theme-color`/`color-scheme`, and a blank page (not even a message) without JavaScript. | `index.html` | Added both meta tags and a `<noscript>` explanation that points at `/api/health`. |
 | 17 | `Config Models` was disabled mid-session with no explanation. | `ConnectionPanel.tsx` | `aria-expanded`/`aria-controls` plus a title/`Start is disabled` style hint that settings are locked while live. |
 
+## Screenshots (built app, production mode)
+
+| | |
+| --- | --- |
+| Desktop, session live: `docs/screenshots/desktop-session.png` | Idle: `docs/screenshots/desktop-idle.png` |
+| Phone (390 px) during a socket drop: `docs/screenshots/mobile-reconnecting.png` | Architecture tab: `docs/screenshots/architecture.png` |
+
+Captured from `node server.js` (the Render command) with a mock Deepgram
+upstream, so the screenshots show the real built bundle, not dev sources.
+
 ## Deliberately unchanged
 
 * Audio capture/playback pipeline (`audioStreamer.ts`, `audioPlayer.ts`), the

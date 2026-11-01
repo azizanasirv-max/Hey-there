@@ -651,9 +651,11 @@ export default function App() {
           setStatus(next as ConnectionStatus);
           if (next === 'RECONNECTING') {
             setReconnectAttempt(info?.attempt ?? null);
+            const why = info?.reason && info.reason !== 'connection lost' ? ` (${info.reason})` : '';
             setNoticeMessage(
-              `Connection lost (${info?.reason || 'transport'}). Reconnecting in ${info?.nextRetryMs ?? 0} ms ` +
-                `(attempt ${info?.attempt ?? 1}). The microphone stays open.`
+              `The socket dropped${why}. Retrying in ${Math.round(info?.nextRetryMs ?? 0)} ms` +
+                ` — attempt ${info?.attempt ?? 1}.` +
+                ' The microphone stays open; audio resumes automatically.'
             );
           } else if (next === 'READY' || next === 'DISCONNECTED' || next === 'ERROR') {
             setReconnectAttempt(null);
@@ -857,7 +859,7 @@ export default function App() {
       {activeTab === 'prototype-1' && (
         <StatusStrip
           status={status}
-          message={errorMessage || noticeMessage}
+          message={errorMessage}
           attempt={reconnectAttempt}
           onStopSession={handleStopSession}
           onRetry={() => void handleStartSession()}

@@ -12,3 +12,6 @@ server.js
 # Local TLS materials used by the production-mode verification test
 tests/.certs/
 .bench
+
+# Local screenshot output (docs/screenshots is tracked)
+artifacts/

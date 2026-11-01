@@ -42,10 +42,12 @@ export const StatusStrip: React.FC<StatusStripProps> = ({ status, message, attem
     ? 'Applying Deepgram settings…'
     : 'Connecting to the proxy…';
 
+  // The Connection panel carries the long, stateful notice; the strip stays
+  // short so the two never read as duplicate text.
   const detail = isError
-    ? message || 'The session stopped unexpectedly.'
+    ? message || 'The session stopped unexpectedly. Start it again to reconnect.'
     : isReconnecting
-    ? message || 'The microphone stays open; audio resumes automatically once the socket is back.'
+    ? 'The microphone stays open — audio resumes automatically once the socket is back. Stop to end the session.'
     : 'Waiting for Welcome → Settings → SettingsApplied before the microphone is unlocked.';
 
   return (

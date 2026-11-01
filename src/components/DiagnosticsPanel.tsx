@@ -54,7 +54,7 @@ export const DiagnosticsPanel: React.FC<DiagnosticsPanelProps> = ({
       <div className="px-5 py-3.5 border-b border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-900/90 rounded-t-xl shrink-0">
         <div className="flex items-center gap-2 min-w-0">
           <Terminal className="w-4 h-4 text-cyan-400 shrink-0" aria-hidden="true" />
-          <h2 className="text-sm font-bold text-slate-100 truncate">Diagnostics &amp; Protocol Event Log</h2>
+          <h2 className="text-sm font-bold text-slate-100 truncate">Diagnostics &amp; Event Log</h2>
           <span className="text-xs font-mono text-slate-500 bg-slate-950 px-2 py-0.5 rounded-full border border-slate-800 shrink-0">
             {events.length} events
           </span>
